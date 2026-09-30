@@ -1,0 +1,101 @@
+module AMM.PoolAnnouncement where
+
+import qualified AMM.Pool as P
+import DA.Time (RelTime)
+
+{-
+  POOL ANNOUNCEMENT - Append-Only Pool Discovery
+
+  Design Philosophy (from ChatGPT feedback):
+  - NO mutable registry that gets updated
+  - Append-only announcements that never archive
+  - Each pool creation announces itself once
+  - Clients query all announcements to discover pools
+  - Immutable record = no write contention, no race conditions
+
+  Key Features:
+  - One announcement per pool (created when pool is created)
+  - Never archived (permanent discovery record)
+  - No choices (immutable announcement)
+  - Searchable by token pair, operator, or pool ID
+-}
+
+-- Append-only announcement for pool discovery
+template PoolAnnouncement
+  with
+    poolOperator : Party    -- Who created/operates the pool
+    poolId : Text           -- Unique pool identifier
+    symbolA : Text          -- First token symbol
+    issuerA : Party         -- First token issuer
+    symbolB : Text          -- Second token symbol
+    issuerB : Party         -- Second token issuer
+    feeBps : Int            -- Fee in basis points (e.g., 30 = 0.3%)
+    maxTTL : RelTime        -- Max time-to-live for swaps
+    createdAt : Time        -- When pool was created
+  where
+    signatory poolOperator
+    -- Token issuers observe announcements for their tokens (enables discovery)
+    observer issuerA, issuerB
+
+    -- No contract key - allows multiple announcements for same pair
+    -- (different operators can create competing pools)
+
+    -- Canonical ordering ensures consistency
+    ensure
+      (symbolA, show issuerA) < (symbolB, show issuerB) &&
+      feeBps >= 0 && feeBps <= 10000  -- 0% to 100%
+
+    -- NO CHOICES - This is an immutable announcement
+    -- Once created, it exists forever for discovery
+
+
+{-
+  USAGE PATTERN:
+
+  1. When creating a new Pool:
+     ```daml
+     -- Create the pool
+     pool <- create Pool with ...
+
+     -- Announce it (append-only)
+     announcement <- create PoolAnnouncement with
+       poolOperator = operator
+       poolId = poolId
+       symbolA = "ETH"
+       issuerA = ethIssuer
+       symbolB = "USDC"
+       issuerB = usdcIssuer
+       feeBps = 30
+       maxTTL = seconds 120
+       createdAt = now
+     ```
+
+  2. Client discovers pools:
+     ```typescript
+     // Off-ledger query (TypeScript/JSON API)
+     const announcements = await ledger.query(PoolAnnouncement);
+
+     // Filter by token pair
+     const ethUsdcPools = announcements.filter(a =>
+       a.symbolA === "ETH" && a.symbolB === "USDC"
+     );
+
+     // Choose best pool (lowest fees, most liquidity, etc.)
+     const bestPool = ethUsdcPools.sort((a, b) => a.feeBps - b.feeBps)[0];
+     ```
+
+  3. Execute swap using discovered pool:
+     ```daml
+     -- Use poolId from announcement to find pool
+     swapRequest <- create SwapRequest with
+       poolCid = poolFromAnnouncement  -- Discovered pool
+       ...
+     ```
+
+  BENEFITS:
+  - ✅ No write contention (announcements never update)
+  - ✅ Scalable (any number of pools can announce)
+  - ✅ Decentralized (no central registry party)
+  - ✅ Historical record (all pools ever created)
+  - ✅ Competing pools (multiple operators, same pair)
+-}

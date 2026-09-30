@@ -1,0 +1,66 @@
+module AMM.AtomicSwap where
+
+import qualified Token.Token as T
+import qualified AMM.Pool as P
+import qualified AMM.SwapRequest as SR
+import qualified AMM.Receipt as R
+import DA.Time (RelTime)
+
+-- Standalone atomic swap template that works with existing Pools
+-- This creates a SwapRequest and immediately executes PrepareSwap + ExecuteSwap atomically
+template AtomicSwapProposal
+  with
+    trader : Party
+    poolCid : ContractId P.Pool
+    poolParty : Party
+    poolOperator : Party
+    issuerA : Party
+    issuerB : Party
+    symbolA : Text
+    symbolB : Text
+    feeBps : Int
+    maxTTL : RelTime
+    protocolFeeReceiver : Party
+    traderInputTokenCid : ContractId T.Token
+    inputSymbol : Text
+    inputAmount : Numeric 10
+    outputSymbol : Text
+    minOutput : Numeric 10
+    maxPriceImpactBps : Int
+    deadline : Time
+  where
+    signatory trader
+    observer poolParty
+
+    -- Atomic execution: create SwapRequest, PrepareSwap, then ExecuteSwap all in one transaction
+    choice ExecuteAtomicSwap : ContractId R.Receipt
+      controller trader, poolParty
+      do
+        -- Step 1: Create SwapRequest
+        swapRequestCid <- create SR.SwapRequest with
+          trader = trader
+          poolCid = poolCid
+          poolParty = poolParty
+          poolOperator = poolOperator
+          issuerA = issuerA
+          issuerB = issuerB
+          symbolA = symbolA
+          symbolB = symbolB
+          feeBps = feeBps
+          maxTTL = maxTTL
+          inputTokenCid = traderInputTokenCid
+          inputSymbol = inputSymbol
+          inputAmount = inputAmount
+          outputSymbol = outputSymbol
+          minOutput = minOutput
+          deadline = deadline
+          maxPriceImpactBps = maxPriceImpactBps
+
+        -- Step 2: PrepareSwap (creates SwapReady)
+        (swapReadyCid, _poolInputTokenCid) <- exercise swapRequestCid SR.PrepareSwap with
+          protocolFeeReceiver = protocolFeeReceiver
+
+        -- Step 3: ExecuteSwap immediately (in same transaction - atomic!)
+        receiptCid <- exercise swapReadyCid SR.ExecuteSwap
+
+        return receiptCid

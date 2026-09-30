@@ -1,0 +1,226 @@
+module AMM.SwapRequest where
+
+import qualified Token.Token as T
+import qualified AMM.Pool as P
+import qualified AMM.Receipt as R
+import DA.Action (void)
+import DA.Time (RelTime, subTime, addRelTime, hours)
+
+-- Proposition de swap créée par le trader
+-- Pattern Proposal-Accept pour éviter les nested choices
+template SwapRequest
+  with
+    trader : Party
+    poolCid : ContractId P.Pool
+    poolParty : Party
+    poolOperator : Party
+    issuerA : Party
+    issuerB : Party
+    symbolA : Text
+    symbolB : Text
+    feeBps : Int
+    maxTTL : RelTime
+    inputTokenCid : ContractId T.Token
+    inputSymbol : Text
+    inputAmount : Numeric 10
+    outputSymbol : Text
+    minOutput : Numeric 10
+    deadline : Time
+    maxPriceImpactBps : Int
+  where
+    signatory trader
+    observer poolParty
+
+    -- Annuler la demande si le trader change d'avis
+    choice CancelSwapRequest : ()
+      controller trader
+      do
+        return ()
+
+    -- Le trader "prépare" le swap en transférant son token au pool
+    -- controller trader ONLY because Transfer has controller owner
+    -- Returns: (SwapReady CID, poolInputToken CID)
+    choice PrepareSwap : (ContractId SwapReady, ContractId T.Token)
+      with
+        protocolFeeReceiver : Party  -- Pass as parameter instead of fetching
+      controller trader
+      do
+        -- Calculate protocol fee (25% of total 0.3% fee)
+        let totalFeeRate = intToDecimal feeBps / 10000.0      -- 0.003 (0.3%)
+        let totalFeeAmount = inputAmount * totalFeeRate        -- Total fee
+        let protocolFeeAmount = totalFeeAmount * 0.25          -- 25% to protocol
+        let amountAfterProtocolFee = inputAmount - protocolFeeAmount    -- Rest to pool
+
+        -- Use TransferSplit to send protocol fee AND keep remainder
+        (maybeRemainder, _) <- exercise inputTokenCid T.TransferSplit with
+          recipient = protocolFeeReceiver
+          qty = protocolFeeAmount
+
+        -- Get the remainder token CID
+        let Some remainderCid = maybeRemainder
+
+        -- Transfer remainder to pool for swap
+        poolInputTokenCid <- exercise remainderCid T.Transfer with
+          recipient = poolParty
+          qty = amountAfterProtocolFee
+
+        -- Créer SwapReady avec amount AFTER protocol fee extraction
+        swapReadyCid <- create SwapReady with
+          trader = trader
+          poolCid = poolCid
+          poolParty = poolParty
+          protocolFeeReceiver = protocolFeeReceiver
+          issuerA = issuerA
+          issuerB = issuerB
+          symbolA = symbolA
+          symbolB = symbolB
+          feeBps = feeBps
+          maxTTL = maxTTL
+          inputSymbol = inputSymbol
+          inputAmount = amountAfterProtocolFee  -- Use amount AFTER protocol fee
+          poolInputCid = poolInputTokenCid  -- Store the token CID already at poolParty
+          outputSymbol = outputSymbol
+          minOutput = minOutput
+          deadline = deadline
+          maxPriceImpactBps = maxPriceImpactBps
+          protocolFeeAmount = protocolFeeAmount  -- Pass protocol fee to Receipt
+
+        return (swapReadyCid, poolInputTokenCid)
+
+
+-- Swap prêt à être exécuté par le pool
+template SwapReady
+  with
+    trader : Party
+    poolCid : ContractId P.Pool
+    poolParty : Party
+    protocolFeeReceiver : Party  -- Add this field
+    issuerA : Party
+    issuerB : Party
+    symbolA : Text
+    symbolB : Text
+    feeBps : Int
+    maxTTL : RelTime
+    inputSymbol : Text
+    inputAmount : Numeric 10
+    poolInputCid : ContractId T.Token  -- Token already transferred to poolParty
+    outputSymbol : Text
+    minOutput : Numeric 10
+    deadline : Time
+    maxPriceImpactBps : Int
+    protocolFeeAmount : Numeric 10  -- Protocol fee extracted in PrepareSwap
+  where
+    signatory trader
+    observer poolParty, protocolFeeReceiver  -- Add protocolFeeReceiver as observer
+
+    -- Le pool exécute le swap (calcul x*y=k + transfer output + consolidation)
+    -- CRITICAL-5 & CRITICAL-6 FIX: Use actual pool reserves and update them
+    choice ExecuteSwap : ContractId R.Receipt
+      controller poolParty  -- ONLY poolParty, trader just receives
+      do
+        -- CRITICAL-5 FIX: Fetch pool to get ACTUAL current reserves (not parameters)
+        pool <- fetch poolCid
+
+        -- Validations
+        now <- getTime
+        assertMsg "Swap expired" (now <= deadline)
+
+        -- Use ACTUAL pool reserves directly
+        let poolAmountA = pool.reserveA
+        let poolAmountB = pool.reserveB
+
+        -- Determine direction and get canonical token CIDs from pool
+        let (isAtoB, rin, rout, poolInCidCanonical, poolOutCidCanonical) =
+              if inputSymbol == symbolA
+              then (True, poolAmountA, poolAmountB, pool.tokenACid, pool.tokenBCid)
+              else (False, poolAmountB, poolAmountA, pool.tokenBCid, pool.tokenACid)
+
+        -- CRITICAL-1 FIX: Validate ALL values before any division operations
+        assertMsg "Input reserve must be positive" (rin > 0.0)
+        assertMsg "Output reserve must be positive" (rout > 0.0)
+        assertMsg "Input amount must be positive" (inputAmount > 0.0)
+        assertMsg "Fee basis points must be valid" (feeBps >= 0 && feeBps <= 10000)
+
+        -- Calculate amountOut with CURRENT reserves (not from PreparedSwap)
+        let feeMul = (10000.0 - intToDecimal feeBps) / 10000.0
+        let ainFee = inputAmount * feeMul
+        let denom = rin + ainFee
+        let aout = (ainFee * rout) / denom
+
+        -- Slippage protection
+        assertMsg "Min output not met (slippage)" (aout >= minOutput)
+        assertMsg "Liquidity exhausted" (aout < rout)
+
+        -- Apply configurable limits on rin/rout (direction-aware)
+        let maxInputAmount = rin * (intToDecimal pool.maxInBps) / 10000.0
+        let maxOutputAmount = rout * (intToDecimal pool.maxOutBps) / 10000.0
+        assertMsg "Input exceeds maxInBps limit" (inputAmount <= maxInputAmount)
+        assertMsg "Output exceeds maxOutBps limit" (aout <= maxOutputAmount)
+
+        -- MEDIUM-3 FIX: Enforce reasonable price impact limits
+        assertMsg "Price impact tolerance too high (max 50% allowed)"
+          (maxPriceImpactBps <= 5000)
+
+        -- Price impact check (safe because rin, rout, pBefore all > 0)
+        let pBefore = rout / rin
+        let pAfter = (rout - aout) / (rin + inputAmount)
+        let impBps = abs(pAfter - pBefore) / pBefore * 10000.0
+        assertMsg "Price impact too high" (impBps <= intToDecimal maxPriceImpactBps)
+
+        -- Pool must have actual tokens to swap (cannot swap on empty pool with just reserves)
+        assertMsg "Pool has no output tokens (empty pool - add liquidity first)"
+          (case poolOutCidCanonical of
+            None -> False
+            Some _ -> True)
+
+        -- CONSOLIDATION: Merge poolInputCid into canonical token (NO new transfer!)
+        -- poolInputCid is already owned by poolParty from PrepareSwap
+        consolidatedInCid <- case poolInCidCanonical of
+          None -> return poolInputCid  -- First swap: this becomes canonical
+          Some canonicalCid -> exercise canonicalCid T.Merge with otherTokenCid = poolInputCid
+
+        -- Transfer output from pool to trader
+        let Some canonicalOutCid = poolOutCidCanonical  -- Guaranteed to exist after validation above
+        (maybePoolOutRemainder, traderOutputCid) <- exercise canonicalOutCid T.TransferSplit with
+          recipient = trader
+          qty = aout
+
+        let Some poolOutRemainderCid = maybePoolOutRemainder  -- Must have remainder (aout < rout)
+
+        -- Calculate new reserves
+        let newReserveA = if isAtoB
+                         then rin + inputAmount  -- Input was A
+                         else rout - aout        -- Output was A
+        let newReserveB = if isAtoB
+                         then rout - aout        -- Output was B
+                         else rin + inputAmount  -- Input was B
+
+        -- Verify new reserves are still positive
+        assertMsg "New reserve A must be positive" (newReserveA > 0.0)
+        assertMsg "New reserve B must be positive" (newReserveB > 0.0)
+
+        -- Update pool with new reserves and consolidated token CIDs
+        let (finalTokenACid, finalTokenBCid) = if isAtoB
+              then (consolidatedInCid, poolOutRemainderCid)
+              else (poolOutRemainderCid, consolidatedInCid)
+
+        -- Update pool using choice (poolParty is controller)
+        newPool <- exercise poolCid P.ArchiveAndUpdateReserves with
+          updatedReserveA = newReserveA
+          updatedReserveB = newReserveB
+          updatedTokenACid = Some finalTokenACid
+          updatedTokenBCid = Some finalTokenBCid
+
+        -- Create Receipt for audit trail
+        create R.Receipt with
+          trader = trader
+          poolParty = poolParty
+          inputSymbol = inputSymbol
+          outputSymbol = outputSymbol
+          amountIn = inputAmount
+          amountOut = aout
+          protocolFee = protocolFeeAmount  -- Protocol fee extracted in PrepareSwap
+          price = aout / inputAmount  -- Quote per base
+          outputTokenCid = traderOutputCid
+          newPoolCid = newPool
+          timestamp = now

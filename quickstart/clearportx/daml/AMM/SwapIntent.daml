@@ -1,0 +1,80 @@
+-- | SwapIntent template for tracking pending swaps.
+-- Created when user sends a TransferInstruction to the pool.
+-- Archived when ExecuteSwap completes or when cancelled after expiry.
+module AMM.SwapIntent where
+
+import AMM.HoldingAdapter (InstrumentId, TransferInstructionCid, instrumentIdEq)
+
+-- | Direction of swap: A->B or B->A
+data SwapDirection = AtoB | BtoA
+  deriving (Eq, Show)
+
+-- | Pool key identifier (operator + instruments)
+data PoolKey = PoolKey
+  with
+    operator : Party
+    instrumentA : InstrumentId
+    instrumentB : InstrumentId
+  deriving (Eq, Show)
+
+-- | SwapIntent represents a user's pending swap request.
+-- Created by backend when user's TransferInstruction is detected.
+-- The transferInstructionCid points to the user's incoming TI.
+template SwapIntent
+  with
+    user : Party                           -- The user initiating the swap
+    operator : Party                       -- Pool operator (ClearportX)
+    poolKey : PoolKey                      -- Which pool to use
+    transferInstructionCid : TransferInstructionCid  -- User's incoming TI
+    inputAmount : Decimal                  -- Amount user is sending
+    inputInstrument : InstrumentId         -- Instrument user is sending
+    direction : SwapDirection              -- AtoB or BtoA
+    minOutput : Decimal                    -- Minimum output amount (slippage protection)
+    createdAt : Time                       -- When intent was created
+    expiresAt : Time                       -- When intent expires
+  where
+    signatory user
+    observer operator
+
+    ensure
+      inputAmount > 0.0 &&
+      minOutput >= 0.0 &&
+      expiresAt > createdAt
+
+    -- | Cancel the intent - only allowed after expiry.
+    -- This allows user to reclaim if swap wasn't executed.
+    choice CancelIntent : ()
+      controller user
+      do
+        now <- getTime
+        assertMsg "Cannot cancel before expiry" (now >= expiresAt)
+        return ()
+
+    -- | Validate that input instrument matches expected direction.
+    -- FIX2: Validate input instrument matches direction (AtoB->A, BtoA->B)
+    nonconsuming choice ValidateInputInstrument : Bool
+      controller operator
+      do
+        let expectedInstrument = case direction of
+              AtoB -> poolKey.instrumentA
+              BtoA -> poolKey.instrumentB
+        return $ instrumentIdEq inputInstrument expectedInstrument
+
+    -- | Execute choice - operator can consume this to execute the swap.
+    -- This allows HoldingPool.ExecuteSwap to archive the intent without user signature.
+    choice Execute : ()
+      controller operator
+      do
+        return ()
+
+-- | Helper to get expected input instrument for a direction
+expectedInputInstrument : PoolKey -> SwapDirection -> InstrumentId
+expectedInputInstrument pk dir = case dir of
+  AtoB -> pk.instrumentA
+  BtoA -> pk.instrumentB
+
+-- | Helper to get expected output instrument for a direction
+expectedOutputInstrument : PoolKey -> SwapDirection -> InstrumentId
+expectedOutputInstrument pk dir = case dir of
+  AtoB -> pk.instrumentB
+  BtoA -> pk.instrumentA

@@ -1,0 +1,19 @@
+sdk-version: 3.4.7
+name: clearportx-amm-production-gv-compat
+source: daml
+version: 1.0.27
+parties:
+  - PoolOperator
+  - PoolParty
+  - LPIssuer
+  - IssuerUSDC
+  - IssuerETH
+  - Alice
+  - Bob
+  - Charlie
+dependencies:
+  - daml-prim
+  - daml-stdlib
+  - daml-script
+data-dependencies: []
+build-options: []

@@ -1,0 +1,35 @@
+module AMM.Receipt where
+
+import qualified Token.Token as T
+import qualified AMM.Pool as P
+
+{-
+  RECEIPT TEMPLATE - Audit Trail for Swaps
+
+  Created by ExecuteSwap to provide a permanent record of the transaction.
+  Contains all relevant information for auditing and display purposes.
+-}
+
+template Receipt
+  with
+    trader : Party
+    poolParty : Party
+    inputSymbol : Text
+    outputSymbol : Text
+    amountIn : Numeric 10
+    amountOut : Numeric 10
+    protocolFee : Numeric 10
+    price : Numeric 10           -- Quote per base (amountOut / amountIn)
+    outputTokenCid : ContractId T.Token
+    newPoolCid : ContractId P.Pool
+    timestamp : Time
+  where
+    signatory poolParty
+    observer trader
+
+    -- Trader can acknowledge receipt (optional cleanup)
+    choice AcknowledgeReceipt : ()
+      controller trader
+      do
+        archive self
+        return ()

@@ -1,0 +1,56 @@
+-- Protocol Fee Collection for ClearportX
+-- 25% of swap fees go to protocol treasury
+module AMM.ProtocolFees where
+
+import qualified Token.Token as T
+import DA.Time
+
+-- Protocol fee collection contract
+-- Tracks accumulated fees from swaps
+template ProtocolFeeCollector
+  with
+    treasury : Party        -- ClearportX treasury
+    poolId : Text          -- Which pool generated these fees
+    tokenSymbol : Text     -- CANTON, USDC, etc.
+    tokenIssuer : Party    -- Token issuer
+    accumulatedFees : Numeric 10  -- Total fees collected
+    lastCollectionTime : Time
+  where
+    signatory treasury
+    observer tokenIssuer
+
+    -- Add fees from a swap
+    choice AddProtocolFee : ContractId ProtocolFeeCollector
+      with
+        feeAmount : Numeric 10
+        swapTime : Time
+      controller treasury
+      do
+        create this with
+          accumulatedFees = accumulatedFees + feeAmount
+          lastCollectionTime = swapTime
+
+    -- Withdraw accumulated fees
+    choice WithdrawProtocolFees : (ContractId T.Token, ContractId ProtocolFeeCollector)
+      with
+        recipient : Party
+      controller treasury
+      do
+        -- Create token for accumulated fees
+        tokenCid <- create T.Token with
+          issuer = tokenIssuer
+          owner = recipient
+          symbol = tokenSymbol
+          amount = accumulatedFees
+
+        -- Reset collector
+        newCollectorCid <- create this with
+          accumulatedFees = 0.0
+
+        return (tokenCid, newCollectorCid)
+
+    -- View current fees (non-consuming)
+    nonconsuming choice GetAccumulatedFees : Numeric 10
+      controller treasury
+      do
+        return accumulatedFees

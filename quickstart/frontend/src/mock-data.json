@@ -1,0 +1,105 @@
+{
+  "tokens": [
+    {
+      "symbol": "USDC",
+      "name": "USD Coin",
+      "decimals": 6,
+      "balance": 10000.5,
+      "contractId": "mock-usdc-contract-001"
+    },
+    {
+      "symbol": "ETH",
+      "name": "Ethereum",
+      "decimals": 18,
+      "balance": 25.75,
+      "contractId": "mock-eth-contract-001"
+    },
+    {
+      "symbol": "BTC",
+      "name": "Bitcoin",
+      "decimals": 8,
+      "balance": 2.5,
+      "contractId": "mock-btc-contract-001"
+    },
+    {
+      "symbol": "USDT",
+      "name": "Tether USD",
+      "decimals": 6,
+      "balance": 8500.25,
+      "contractId": "mock-usdt-contract-001"
+    },
+    {
+      "symbol": "DAI",
+      "name": "Dai Stablecoin",
+      "decimals": 18,
+      "balance": 3200.8,
+      "contractId": "mock-dai-contract-001"
+    }
+  ],
+  "pools": [
+    {
+      "contractId": "mock-pool-usdc-eth-001",
+      "tokenA": {
+        "symbol": "USDC",
+        "name": "USD Coin",
+        "decimals": 6
+      },
+      "tokenB": {
+        "symbol": "ETH",
+        "name": "Ethereum",
+        "decimals": 18
+      },
+      "reserveA": 50000,
+      "reserveB": 25,
+      "totalLiquidity": 1118.03,
+      "feeRate": 0.003,
+      "apr": 12.5,
+      "volume24h": 125000
+    },
+    {
+      "contractId": "mock-pool-usdc-btc-001",
+      "tokenA": {
+        "symbol": "USDC",
+        "name": "USD Coin",
+        "decimals": 6
+      },
+      "tokenB": {
+        "symbol": "BTC",
+        "name": "Bitcoin",
+        "decimals": 8
+      },
+      "reserveA": 100000,
+      "reserveB": 2,
+      "totalLiquidity": 447.21,
+      "feeRate": 0.003,
+      "apr": 8.2,
+      "volume24h": 85000
+    },
+    {
+      "contractId": "mock-pool-eth-btc-001",
+      "tokenA": {
+        "symbol": "ETH",
+        "name": "Ethereum",
+        "decimals": 18
+      },
+      "tokenB": {
+        "symbol": "BTC",
+        "name": "Bitcoin",
+        "decimals": 8
+      },
+      "reserveA": 20,
+      "reserveB": 1,
+      "totalLiquidity": 4.47,
+      "feeRate": 0.003,
+      "apr": 15.8,
+      "volume24h": 45000
+    }
+  ],
+  "transactions": [],
+  "appConfig": {
+    "slippage": 0.5,
+    "deadline": 20,
+    "isExpertMode": false,
+    "theme": "light"
+  }
+}

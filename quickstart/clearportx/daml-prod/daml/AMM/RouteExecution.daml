@@ -1,0 +1,21 @@
+module AMM.RouteExecution where
+
+import qualified Token.Token as T
+import qualified AMM.Pool as P
+import qualified AMM.SwapRequest as SR
+import DA.Time (subTime)
+
+{-
+  PHASE 3: MULTI-HOP ROUTING
+
+  Enables swaps across multiple pools atomically.
+  Example: ETH → USDC → DAI (2 hops)
+
+  Architecture:
+  - Off-ledger: Client finds best route using PoolAnnouncements
+  - On-ledger: Execute swaps sequentially through existing SwapRequest
+  - Slippage: Only check final output (intermediate steps use minOutput=0)
+
+  Note: This is a simplified multi-hop that chains SwapRequests.
+  Each hop creates a SwapRequest → PrepareSwap → ExecuteSwap.
+-}

@@ -1,0 +1,71 @@
+# Metrics and monitoring configuration
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics,prometheus,info
+      base-path: /api/actuator
+  endpoint:
+    health:
+      show-details: when_authorized
+      probes:
+        enabled: true
+    metrics:
+      enabled: true
+    prometheus:
+      enabled: true
+    info:
+      enabled: true
+      env:
+        enabled: true
+      java:
+        enabled: true
+      os:
+        enabled: true
+  metrics:
+    enable:
+      jvm: true
+      process: true
+      system: true
+      tomcat: true
+    export:
+      prometheus:
+        enabled: true
+      otlp:
+        enabled: false  # Disabled to avoid duplicate metrics (using Prometheus scrape instead)
+        url: http://otel-collector:4318/v1/metrics
+        step: 10s
+        resource-attributes:
+          service.name: clearportx-backend
+          service.namespace: clearportx
+          service.version: ${APP_VERSION:1.0.1}
+          deployment.environment: ${ENVIRONMENT:localnet}
+    distribution:
+      percentiles-histogram:
+        clearportx.swap.input.amount: true
+        clearportx.swap.output.amount: true
+        clearportx.swap.price_impact.bps: true
+        clearportx.swap.execution.time: true
+      slo:
+        # Define SLOs for swap execution time (in ms)
+        clearportx.swap.execution.time: 100,500,1000,2000,5000
+    tags:
+      app: clearportx
+      env: ${ENVIRONMENT:localnet}
+      version: ${APP_VERSION:1.0.1}
+      packageId: ${CLEARPORTX_PACKAGE_ID:unknown}
+
+# Build info for /actuator/info
+info:
+  app:
+    name: ClearportX Backend
+    description: Atomic swap backend for Canton DEX
+    version: ${APP_VERSION:1.0.1}
+  build:
+    artifact: clearportx-backend
+    name: ${project.name:clearportx-backend}
+    version: ${project.version:1.0.1}
+  dar:
+    version: 1.0.1
+    packageId: ${CLEARPORTX_PACKAGE_ID:unknown}
+    atomicSwapEnabled: true

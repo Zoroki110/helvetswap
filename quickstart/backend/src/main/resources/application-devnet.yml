@@ -1,0 +1,218 @@
+# ClearportX Backend - Devnet Configuration v2.1.0-hardened
+
+spring:
+  application:
+    name: clearportx-backend
+  mvc:
+    async:
+      request-timeout: 120000
+
+  # Disable DataSource autoconfiguration when PQS is not enabled
+  # This allows Ledger API-only mode for Canton 3.4.7
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceTransactionManagerAutoConfiguration
+
+  # Redis Configuration (Distributed Rate Limiter)
+  redis:
+    host: ${REDIS_HOST:redis-cluster}
+    port: ${REDIS_PORT:6379}
+    password: ${REDIS_PASSWORD:}
+    timeout: 2000ms
+    lettuce:
+      pool:
+        max-active: 20
+        max-idle: 10
+        min-idle: 2
+
+# Rate Limiter Configuration
+rate-limiter:
+  enabled: true
+  distributed: false  # Disable Redis for initial testing
+  global-max-per-5s: 2  # 0.4 TPS global limit
+  party-max-per-min: 10  # 10 requests per minute per party
+  public-rpm-per-ip: 30  # 30 requests per minute per IP for public endpoints
+  auth-rpm-per-ip: 10  # 10 requests per minute per IP for auth endpoints
+  redis-key-ttl: 6  # Redis key TTL in seconds (must be > 5s window)
+
+# Scheduled Tasks
+scheduled:
+  pool-metrics-interval-ms: 10000  # Update active pools gauge every 10s
+  pool-metrics-timeout-ms: 500  # ACS query timeout for gauge update
+
+# Health Endpoint Configuration
+health:
+  pqs-timeout-ms: 200  # PQS offset query timeout (best-effort)
+  ledger-timeout-ms: 5000  # Ledger connection check timeout
+
+# Idempotency Configuration
+idempotency:
+  cache-ttl-minutes: 15  # Idempotency key TTL
+  cleanup-interval-ms: 300000  # Clean expired entries every 5 minutes
+  never-cache-5xx: true  # Never cache 5xx server errors
+
+# CORS Configuration
+# NOTE: Spring profiles override the main application.yml CORS config
+# IMPORTANT: WebSecurityConfig expects comma-separated strings, NOT YAML lists
+# Add exact ngrok URL here (no wildcards like *.ngrok-free.dev)
+cors:
+  allowed-origins: https://app.clearportx.com,https://clearportxapp.vercel.app,https://nonexplicable-lacily-leesa.ngrok-free.dev,http://localhost:3000,http://localhost:3001,http://localhost:4001
+  allowed-methods: GET,POST,PUT,DELETE,OPTIONS,HEAD
+  allowed-headers: Authorization,Content-Type,X-Idempotency-Key,X-Request-ID
+  exposed-headers: Retry-After,X-Request-ID,Authorization,X-Total-Count,X-Rate-Limit-Remaining
+  allow-credentials: true
+  max-age: 3600
+
+# OAuth2 Resource Server (Local Keycloak)
+security:
+  oauth2:
+    resourceserver:
+      jwt:
+        issuer-uri: ${OAUTH_ISSUER:http://localhost:8082/realms/AppProvider}
+        jwk-set-uri: ${OAUTH_JWKS:http://localhost:8082/realms/AppProvider/protocol/openid-connect/certs}
+    audience: ${OAUTH_AUDIENCE:app-provider-unsafe}
+  canton:
+    static-party: ${CANTON_PARTY:Alice-9cefe94d}
+
+# Ledger API Configuration (Local DevNet Validator)
+ledger:
+  host: ${LEDGER_API_HOST:localhost}
+  port: ${LEDGER_API_PORT:5001}
+  tls: false  # Local participant doesn't use TLS
+  max-inbound-message-size: 10000000  # 10 MB
+  # Multi-asset registry routing for TransferInstruction acceptance
+  registry:
+    # Default registry (Amulet/CC via DevNet Scan)
+    default-base-uri: ${LEDGER_REGISTRY_DEFAULT_BASE_URI:https://scan.sv-1.dev.global.canton.network.digitalasset.com}
+    # Fallback registries to try if default returns 404/empty (comma-separated)
+    fallback-base-uris: ${LEDGER_REGISTRY_FALLBACK_BASE_URIS:}
+    # Admin-to-registry mapping (JSON format: {"adminParty": "baseUri", ...})
+    # Known admins:
+    #   Amulet: DSO::1220be58c29e65de40bf273be1dc2b266d43a9a002ea5b18955aeef7aac881bb471a
+    #   CBTC: <placeholder - obtain from CBTC team>
+    by-admin: ${LEDGER_REGISTRY_BY_ADMIN:{}}
+  # Base URL for TransferFactory registry (used with /registry/transfer-instruction/v1/transfer-factory)
+  registry-transfer-factory-url: ${LEDGER_REGISTRY_TRANSFER_FACTORY_URL:https://scan.sv-1.dev.global.canton.network.sync.global}
+
+# PQS Configuration
+pqs:
+  jdbc-url: ${PQS_JDBC_URL:jdbc:postgresql://pqs.devnet.canton.network:5432/pqs}
+  username: ${PQS_USERNAME:pqs_user}
+  password: ${PQS_PASSWORD:}
+  pool-size: 5
+  sync-timeout-ms: 30000  # 30s max wait for PQS sync
+  stale-retry-max-attempts: 3  # Max retries on stale ACS
+  stale-retry-delay-ms: 1000  # Delay between retries
+
+# Metrics & Observability
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus,info,metrics
+  endpoint:
+    health:
+      show-details: when_authorized
+    prometheus:
+      enabled: true
+  metrics:
+    export:
+      prometheus:
+        enabled: true
+    tags:
+      app: clearportx
+      env: devnet
+      version: ${APP_VERSION:1.0.1}
+      packageId: ${DAR_PACKAGE_ID:unknown}
+
+holdingpool:
+  package-id: 782249463e3c27c0ad0ee501dd0f679ccd96abeeea72d54cf1d405a798561843
+
+liquidity:
+  consume:
+    wait-ms: 45000
+    poll-ms: 2000
+
+# AppProvider party binding (DevNet)
+application:
+  tenants:
+    AppProvider:
+      partyId: ${APP_PROVIDER_PARTY:ClearportX-DEX-1::122081f2b8e29cbe57d1037a18e6f70e57530773b3a4d1bea6bab981b7a76e943b37}
+
+# Logging Configuration
+logging:
+  level:
+    root: INFO
+    com.digitalasset.quickstart: DEBUG
+    com.digitalasset.quickstart.security: DEBUG
+    com.digitalasset.quickstart.config.RateLimiterConfig: DEBUG
+    com.digitalasset.quickstart.service.IdempotencyService: DEBUG
+    org.springframework.security: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [requestId=%X{requestId}] - %msg%n"
+
+# Application-Specific Configuration
+clearportx:
+  amm:
+    default-slippage-bps: 50  # 0.5% default slippage tolerance
+    max-slippage-bps: 1000  # 10% maximum allowed slippage
+    default-deadline-seconds: 300  # 5 minutes default deadline
+    scale: 10  # Decimal places for token amounts
+
+  swap:
+    timeout-ms: 10000  # 10s timeout for swap operations
+    enable-atomic-swap: true  # Enable atomic swap endpoint
+    # Part A: Configurable retry budget for INACTIVE_CONTRACTS
+    retry:
+      enabled: ${SWAP_RETRY_ENABLED:true}
+      max-attempts: ${SWAP_RETRY_MAX_ATTEMPTS:12}
+      max-wall-ms: ${SWAP_RETRY_MAX_WALL_MS:300000}      # 5 min max total wall clock
+      backoff-max-ms: ${SWAP_RETRY_BACKOFF_MAX_MS:30000}  # 30s max single backoff
+      deadline-margin-ms: ${SWAP_RETRY_DEADLINE_MARGIN_MS:10000}  # 10s safety margin before TI expiry
+    # Part B: OMR participant-refresh fast-path
+    participant-refresh-omr:
+      enabled: ${SWAP_PARTICIPANT_REFRESH_OMR:true}
+      # Default false: Canton 3.x does not include inactive CIDs in error message,
+      # so the parsed set is always empty. Set to false to always attempt refresh.
+      only-when-inactive: ${SWAP_PARTICIPANT_REFRESH_OMR_ONLY_INACTIVE:false}
+    # Part C: Automated TI poller — auto-detects inbound swap TIs and executes them
+    poller:
+      enabled: ${SWAP_POLLER_ENABLED:true}
+      interval-ms: ${SWAP_POLLER_INTERVAL_MS:5000}
+      max-age-seconds: ${SWAP_POLLER_MAX_AGE_SECONDS:300}
+
+  # Part D: Choice-context provider chain (local fallback when Scan is unavailable)
+  choice-context:
+    local-fallback:
+      enabled: ${CHOICE_CONTEXT_LOCAL_FALLBACK:false}  # Default OFF: existing Scan-only behavior
+      omr-visibility-party: ${SWAP_OMR_VISIBILITY_PARTY:}  # Auto-discover if blank
+      auto-discover: ${CHOICE_CONTEXT_AUTO_DISCOVER:true}
+    scan:
+      force-fail: ${FORCE_SCAN_FAIL:false}  # Testing only: simulate dead Scan
+
+  fees:
+    total-bps: 30  # 0.3% total fee
+    protocol-share: 0.25  # 25% to protocol
+    lp-share: 0.75  # 75% to LPs
+
+  security:
+    require-request-id: false  # Auto-generate if missing
+    require-idempotency-key: false  # Optional but recommended
+    validate-body-hash: true  # Enable body-hash mismatch detection
+
+  # DevNet Authentication Configuration
+  auth:
+    mode: oauth  # oauth = full OAuth2/JWT with Canton Network Keycloak; header = simple username in X-User header
+    # User to Canton Party ID mapping (used for JWT subject → party ID resolution)
+    user-party-map:
+      alice: "Alice-9cefe94d::1220414f85e74ed69ca162b9874f3cf9dfa94fb4968823bd8ac9755544fcb5d72388"
+      bob: "Bob-9b3970be::1220414f85e74ed69ca162b9874f3cf9dfa94fb4968823bd8ac9755544fcb5d72388"
+      app-provider: "app-provider-4f1df03a::1220414f85e74ed69ca162b9874f3cf9dfa94fb4968823bd8ac9755544fcb5d72388"
+    jwt-secret: ${CLEARPORTX_AUTH_JWT_SECRET}
+    jwt-issuer: ${CLEARPORTX_AUTH_JWT_ISSUER:clearportx-backend}
+    jwt-ttl-seconds: ${CLEARPORTX_AUTH_JWT_TTL_SECONDS:900}
+
+# CIP-0104 Featured App Activity Markers
+featured-app:
+  enabled: false

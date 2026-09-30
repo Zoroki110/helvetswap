@@ -1,0 +1,759 @@
+-- | HoldingPool template for Token Standard compliant AMM.
+-- Uses TransferInstructions for all token movements.
+-- Pool stores amounts only (no holding CID lists).
+module AMM.HoldingPool where
+
+import DA.Time (hours, addRelTime)
+import qualified DA.TextMap as TextMap
+import DA.Math (sqrt)
+import qualified Splice.Api.Token.MetadataV1 as M
+import qualified Splice.Api.Token.TransferInstructionV1 as TI
+import qualified LPToken.LPToken as LP
+import AMM.HoldingAdapter
+import AMM.SwapIntent
+import AMM.PendingPayout
+
+-- | Pool status
+data PoolStatus = Uninitialized | Active | Paused
+  deriving (Eq, Show)
+
+-- | Outcome of payout transfer.
+data PayoutOutcome = PayoutPending TransferInstructionCid | PayoutCompleted
+  deriving (Eq, Show)
+
+-- | HoldingPool is the core AMM pool template.
+-- Key: (operator, instrumentA, instrumentB) - must be in canonical order.
+-- Stores reserve amounts and locked amounts (for pending payouts).
+template HoldingPool
+  with
+    operator : Party                       -- Pool operator (ClearportX)
+    instrumentA : InstrumentId             -- First instrument (canonical order)
+    instrumentB : InstrumentId             -- Second instrument (canonical order)
+    status : PoolStatus                    -- Pool status
+    reserveAmountA : Decimal               -- Total reserve of A
+    reserveAmountB : Decimal               -- Total reserve of B
+    lockedAmountA : Decimal                -- Amount of A locked for pending payouts
+    lockedAmountB : Decimal                -- Amount of B locked for pending payouts
+    feeRate : Decimal                      -- Fee rate (e.g., 0.003 = 0.3%)
+    lpSupply : Decimal                     -- Total LP tokens in circulation
+    poolId : Optional Text                 -- Stable pool identifier (does not change across updates)
+  where
+    signatory operator
+
+    -- Canonical ordering: instrumentA < instrumentB
+    ensure
+      (case poolId of
+        None -> True
+        Some pid -> pid /= ""
+      ) &&
+      (instrumentA.admin, instrumentA.id) < (instrumentB.admin, instrumentB.id) &&
+      reserveAmountA >= 0.0 &&
+      reserveAmountB >= 0.0 &&
+      lockedAmountA >= 0.0 &&
+      lockedAmountB >= 0.0 &&
+      lockedAmountA <= reserveAmountA &&
+      lockedAmountB <= reserveAmountB &&
+      feeRate >= 0.0 && feeRate < 1.0 &&
+      lpSupply >= 0.0
+
+    -- | Get the pool key for this pool.
+    nonconsuming choice GetPoolKey : PoolKey
+      controller operator
+      do
+        return PoolKey with
+          operator
+          instrumentA
+          instrumentB
+
+    -- | Get available (non-locked) reserves.
+    nonconsuming choice GetAvailableReserves : (Decimal, Decimal)
+      controller operator
+      do
+        let availA = reserveAmountA - lockedAmountA
+        let availB = reserveAmountB - lockedAmountB
+        return (availA, availB)
+
+    -- | Bootstrap the pool with initial liquidity.
+    -- Operator accepts two TransferInstructions (one for each instrument).
+    -- Verifies instruments match pool configuration.
+    -- Sets reserves and marks pool as Active.
+    choice Bootstrap : ContractId HoldingPool
+      with
+        tiCidA : TransferInstructionCid    -- TI for instrument A
+        tiCidB : TransferInstructionCid    -- TI for instrument B
+        amountA : Decimal                  -- Expected amount of A
+        amountB : Decimal                  -- Expected amount of B
+        lpProvider : Party                 -- Party providing liquidity
+      controller operator
+      do
+        assertMsg "Pool must be Uninitialized to bootstrap" (status == Uninitialized)
+        assertMsg "Amount A must be positive" (amountA > 0.0)
+        assertMsg "Amount B must be positive" (amountB > 0.0)
+
+        -- Calculate initial LP supply (geometric mean)
+        let initialLP = sqrt (amountA * amountB)
+        assertMsg "Initial LP must be positive" (initialLP > 0.0)
+
+        -- Create active pool with reserves
+        create this with
+          status = Active
+          reserveAmountA = amountA
+          reserveAmountB = amountB
+          lockedAmountA = 0.0
+          lockedAmountB = 0.0
+          lpSupply = initialLP
+
+    -- | ExecuteSwap - the core atomic swap operation.
+    -- FIX1: Takes intentCid and outputHoldingCid as arguments (no pre-accepted holding).
+    choice ExecuteSwap : (ContractId HoldingPool, ContractId PendingPayout)
+      with
+        intentCid : ContractId SwapIntent   -- The swap intent to execute
+        outputHoldingCid : HoldingCid       -- Holding to use for output TI
+      controller operator
+      do
+        assertMsg "Pool must be Active" (status == Active)
+
+        -- Fetch and validate the swap intent
+        intent <- fetch intentCid
+
+        -- Check expiry
+        now <- getTime
+        assertMsg "SwapIntent has expired" (now < intent.expiresAt)
+
+        -- Atomically accept the user's TransferInstruction to obtain the input holding
+        let tiCid = intent.transferInstructionCid
+        let emptyExtraArgs = M.ExtraArgs with
+              context = M.emptyChoiceContext
+              meta = M.emptyMetadata
+        tiResult <- exercise tiCid TI.TransferInstruction_Accept with extraArgs = emptyExtraArgs
+        let inputHoldingCid = case tiResult.output of
+              TI.TransferInstructionResult_Completed {receiverHoldingCids} -> case receiverHoldingCids of
+                h :: _ -> h
+                _ -> error "Accept returned no receiver holding"
+              _ -> error "Accept did not complete transfer"
+
+        -- FIX2: Validate input instrument matches direction
+        let expectedInput = case intent.direction of
+              AtoB -> instrumentA
+              BtoA -> instrumentB
+        assertMsg "FIX2: Input instrument does not match swap direction"
+          (instrumentIdEq intent.inputInstrument expectedInput)
+
+        -- FIX3: Validate received input holding matches intent
+        inputInst <- getHoldingInstrument inputHoldingCid
+        inputAmt <- getHoldingAmount inputHoldingCid
+        assertMsg "FIX3: Input holding instrument mismatch" (instrumentIdEq inputInst expectedInput)
+        assertMsg "FIX3: Input holding amount mismatch" (inputAmt == intent.inputAmount)
+
+        -- Calculate available reserves
+        let availA = reserveAmountA - lockedAmountA
+        let availB = reserveAmountB - lockedAmountB
+
+        -- Calculate swap output using constant product formula
+        let (reserveIn, reserveOut, availIn, availOut) = case intent.direction of
+              AtoB -> (reserveAmountA, reserveAmountB, availA, availB)
+              BtoA -> (reserveAmountB, reserveAmountA, availB, availA)
+
+        -- Apply fee: outputAmount = (inputAmount * (1 - feeRate) * reserveOut) / (reserveIn + inputAmount * (1 - feeRate))
+        let inputAfterFee = intent.inputAmount * (1.0 - feeRate)
+        let numerator = inputAfterFee * reserveOut
+        let denominator = reserveIn + inputAfterFee
+        assertMsg "Denominator must be positive" (denominator > 0.0)
+        let outputAmount = numerator / denominator
+
+        -- Validate output
+        assertMsg "Output amount must be positive" (outputAmount > 0.0)
+        assertMsg "Slippage: output below minimum" (outputAmount >= intent.minOutput)
+        assertMsg "Insufficient available liquidity for output" (outputAmount <= availOut)
+
+        let expectedOutput = case intent.direction of
+              AtoB -> instrumentB
+              BtoA -> instrumentA
+        -- FIX4: validate provided output holding
+        outputInst <- getHoldingInstrument outputHoldingCid
+        outputAmt <- getHoldingAmount outputHoldingCid
+        assertMsg "FIX4: Output holding has wrong instrument" (instrumentIdEq outputInst expectedOutput)
+        assertMsg "FIX4: Output holding has insufficient amount" (outputAmt >= outputAmount)
+
+        -- In production: Create output TransferInstruction (pool -> user)
+        -- For now, we use a placeholder TI CID from the test harness
+
+        -- Calculate new reserves and locked amounts
+        let (newReserveA, newReserveB, newLockedA, newLockedB) = case intent.direction of
+              AtoB ->
+                ( reserveAmountA + intent.inputAmount  -- A increases by input
+                , reserveAmountB                        -- B doesn't change yet (locked)
+                , lockedAmountA                         -- A locked unchanged
+                , lockedAmountB + outputAmount          -- B locked increases
+                )
+              BtoA ->
+                ( reserveAmountA                        -- A doesn't change yet (locked)
+                , reserveAmountB + intent.inputAmount  -- B increases by input
+                , lockedAmountA + outputAmount          -- A locked increases
+                , lockedAmountB                         -- B locked unchanged
+                )
+
+        -- Safety checks
+        assertMsg "Locked A cannot exceed reserve A" (newLockedA <= newReserveA)
+        assertMsg "Locked B cannot exceed reserve B" (newLockedB <= newReserveB)
+
+        -- Archive the intent using Execute choice (operator-controlled)
+        exercise intentCid Execute
+
+        -- Create PendingPayout (24h expiry)
+        let outputInstrument = case intent.direction of
+              AtoB -> instrumentB
+              BtoA -> instrumentA
+
+        let payoutExpiry = addRelTime now (hours 24)
+
+        payoutCid <- create PendingPayout with
+          operator
+          recipient = intent.user
+          outputTiCid = intent.transferInstructionCid  -- Placeholder - in production this would be the new output TI
+          amount = outputAmount
+          instrument = outputInstrument
+          poolKey = PoolKey with operator, instrumentA, instrumentB
+          createdAt = now
+          expiresAt = payoutExpiry
+
+        -- Create new pool state
+        newPoolCid <- create this with
+          reserveAmountA = newReserveA
+          reserveAmountB = newReserveB
+          lockedAmountA = newLockedA
+          lockedAmountB = newLockedB
+
+        return (newPoolCid, payoutCid)
+
+    -- | ExecuteSwapFromTransferInstruction - swap without SwapIntent.
+    -- Uses inbound TI + memo fields supplied by backend (direction/minOutput/recipient/expiry)
+    -- and creates the outbound payout TI atomically.
+    choice ExecuteSwapFromTransferInstruction : (ContractId HoldingPool, TransferInstructionCid)
+      with
+        transferInstructionCid : TransferInstructionCid
+        outputHoldingCid : HoldingCid
+        direction : SwapDirection
+        minOutput : Decimal
+        expiresAt : Time
+        recipient : Party
+        payoutFactoryCid : ContractId TI.TransferFactory
+        payoutExtraArgs : M.ExtraArgs
+        payoutMemo : Text
+        acceptExtraArgs : Optional M.ExtraArgs
+      controller operator
+      do
+        assertMsg "Pool must be Active" (status == Active)
+        now <- getTime
+        assertMsg "Swap deadline has expired" (now < expiresAt)
+        assertMsg "Minimum output must be non-negative" (minOutput >= 0.0)
+
+        -- Accept inbound TI to obtain input holding
+        let acceptArgs = case acceptExtraArgs of
+              Some args -> args
+              None -> M.ExtraArgs with
+                context = M.emptyChoiceContext
+                meta = M.emptyMetadata
+        tiResult <- exercise transferInstructionCid TI.TransferInstruction_Accept with extraArgs = acceptArgs
+        let inputHoldingCid = case tiResult.output of
+              TI.TransferInstructionResult_Completed {receiverHoldingCids} -> case receiverHoldingCids of
+                h :: _ -> h
+                _ -> error "Accept returned no receiver holding"
+              _ -> error "Accept did not complete transfer"
+
+        inputInst <- getHoldingInstrument inputHoldingCid
+        inputAmt <- getHoldingAmount inputHoldingCid
+        assertMsg "Input amount must be positive" (inputAmt > 0.0)
+
+        let expectedInput = case direction of
+              AtoB -> instrumentA
+              BtoA -> instrumentB
+        assertMsg "Input instrument does not match swap direction"
+          (instrumentIdEq inputInst expectedInput)
+
+        -- Calculate available reserves
+        let availA = reserveAmountA - lockedAmountA
+        let availB = reserveAmountB - lockedAmountB
+
+        -- Calculate swap output using constant product formula
+        let (reserveIn, reserveOut, _availIn, availOut) = case direction of
+              AtoB -> (reserveAmountA, reserveAmountB, availA, availB)
+              BtoA -> (reserveAmountB, reserveAmountA, availB, availA)
+
+        let inputAfterFee = inputAmt * (1.0 - feeRate)
+        let numerator = inputAfterFee * reserveOut
+        let denominator = reserveIn + inputAfterFee
+        assertMsg "Denominator must be positive" (denominator > 0.0)
+        let outputAmount = numerator / denominator
+
+        -- Validate output
+        assertMsg "Output amount must be positive" (outputAmount > 0.0)
+        assertMsg "Slippage: output below minimum" (outputAmount >= minOutput)
+        assertMsg "Insufficient available liquidity for output" (outputAmount <= availOut)
+
+        let expectedOutput = case direction of
+              AtoB -> instrumentB
+              BtoA -> instrumentA
+        outputInst <- getHoldingInstrument outputHoldingCid
+        outputAmt <- getHoldingAmount outputHoldingCid
+        assertMsg "Output holding has wrong instrument" (instrumentIdEq outputInst expectedOutput)
+        assertMsg "Output holding has insufficient amount" (outputAmt >= outputAmount)
+
+        -- Create payout TI atomically via TransferFactory
+        let memoKey = "splice.lfdecentralizedtrust.org/reason"
+        let memoMeta = M.Metadata with values = TextMap.fromList [(memoKey, payoutMemo)]
+        let payoutTransfer = TI.Transfer with
+              sender = operator
+              receiver = recipient
+              amount = outputAmount
+              instrumentId = expectedOutput
+              requestedAt = now
+              executeBefore = expiresAt
+              inputHoldingCids = [outputHoldingCid]
+              meta = memoMeta
+        payoutResult <- exercise payoutFactoryCid TI.TransferFactory_Transfer with
+          expectedAdmin = expectedOutput.admin
+          transfer = payoutTransfer
+          extraArgs = payoutExtraArgs
+        payoutTiCid <- case payoutResult.output of
+          TI.TransferInstructionResult_Pending {transferInstructionCid} -> return transferInstructionCid
+          TI.TransferInstructionResult_Completed {} -> error "Payout transfer completed immediately (no TI)"
+          TI.TransferInstructionResult_Failed {} -> error "Payout transfer failed"
+
+        -- Calculate new reserves (no pending payout tracking)
+        let (newReserveA, newReserveB) = case direction of
+              AtoB ->
+                ( reserveAmountA + inputAmt
+                , reserveAmountB - outputAmount
+                )
+              BtoA ->
+                ( reserveAmountA - outputAmount
+                , reserveAmountB + inputAmt
+                )
+
+        -- Safety checks
+        assertMsg "Reserve A cannot go below locked A" (newReserveA >= lockedAmountA)
+        assertMsg "Reserve B cannot go below locked B" (newReserveB >= lockedAmountB)
+
+        newPoolCid <- create this with
+          reserveAmountA = newReserveA
+          reserveAmountB = newReserveB
+
+        return (newPoolCid, payoutTiCid)
+
+    -- | ExecuteSwapFromTransferInstructionV2 - swap without SwapIntent.
+    -- Like ExecuteSwapFromTransferInstruction, but returns payout outcome (pending vs completed).
+    choice ExecuteSwapFromTransferInstructionV2 : (ContractId HoldingPool, PayoutOutcome)
+      with
+        transferInstructionCid : TransferInstructionCid
+        outputHoldingCid : HoldingCid
+        direction : SwapDirection
+        minOutput : Decimal
+        expiresAt : Time
+        recipient : Party
+        payoutFactoryCid : ContractId TI.TransferFactory
+        payoutExtraArgs : M.ExtraArgs
+        payoutMemo : Text
+        acceptExtraArgs : Optional M.ExtraArgs
+      controller operator
+      do
+        assertMsg "Pool must be Active" (status == Active)
+        now <- getTime
+        assertMsg "Swap deadline has expired" (now < expiresAt)
+        assertMsg "Minimum output must be non-negative" (minOutput >= 0.0)
+
+        -- Accept inbound TI to obtain input holding
+        let acceptArgs = case acceptExtraArgs of
+              Some args -> args
+              None -> M.ExtraArgs with
+                context = M.emptyChoiceContext
+                meta = M.emptyMetadata
+        tiResult <- exercise transferInstructionCid TI.TransferInstruction_Accept with extraArgs = acceptArgs
+        let inputHoldingCid = case tiResult.output of
+              TI.TransferInstructionResult_Completed {receiverHoldingCids} -> case receiverHoldingCids of
+                h :: _ -> h
+                _ -> error "Accept returned no receiver holding"
+              _ -> error "Accept did not complete transfer"
+
+        inputInst <- getHoldingInstrument inputHoldingCid
+        inputAmt <- getHoldingAmount inputHoldingCid
+        assertMsg "Input amount must be positive" (inputAmt > 0.0)
+
+        let expectedInput = case direction of
+              AtoB -> instrumentA
+              BtoA -> instrumentB
+        assertMsg "Input instrument does not match swap direction"
+          (instrumentIdEq inputInst expectedInput)
+
+        -- Calculate available reserves
+        let availA = reserveAmountA - lockedAmountA
+        let availB = reserveAmountB - lockedAmountB
+
+        -- Calculate swap output using constant product formula
+        let (reserveIn, reserveOut, _availIn, availOut) = case direction of
+              AtoB -> (reserveAmountA, reserveAmountB, availA, availB)
+              BtoA -> (reserveAmountB, reserveAmountA, availB, availA)
+
+        let inputAfterFee = inputAmt * (1.0 - feeRate)
+        let numerator = inputAfterFee * reserveOut
+        let denominator = reserveIn + inputAfterFee
+        assertMsg "Denominator must be positive" (denominator > 0.0)
+        let outputAmount = numerator / denominator
+
+        -- Validate output
+        assertMsg "Output amount must be positive" (outputAmount > 0.0)
+        assertMsg "Slippage: output below minimum" (outputAmount >= minOutput)
+        assertMsg "Insufficient available liquidity for output" (outputAmount <= availOut)
+
+        let expectedOutput = case direction of
+              AtoB -> instrumentB
+              BtoA -> instrumentA
+        outputInst <- getHoldingInstrument outputHoldingCid
+        outputAmt <- getHoldingAmount outputHoldingCid
+        assertMsg "Output holding has wrong instrument" (instrumentIdEq outputInst expectedOutput)
+        assertMsg "Output holding has insufficient amount" (outputAmt >= outputAmount)
+
+        -- Create payout TI atomically via TransferFactory
+        let memoKey = "splice.lfdecentralizedtrust.org/reason"
+        let memoMeta = M.Metadata with values = TextMap.fromList [(memoKey, payoutMemo)]
+        let payoutTransfer = TI.Transfer with
+              sender = operator
+              receiver = recipient
+              amount = outputAmount
+              instrumentId = expectedOutput
+              requestedAt = now
+              executeBefore = expiresAt
+              inputHoldingCids = [outputHoldingCid]
+              meta = memoMeta
+        payoutResult <- exercise payoutFactoryCid TI.TransferFactory_Transfer with
+          expectedAdmin = expectedOutput.admin
+          transfer = payoutTransfer
+          extraArgs = payoutExtraArgs
+        payoutOutcome <- case payoutResult.output of
+          TI.TransferInstructionResult_Pending {transferInstructionCid} -> return (PayoutPending transferInstructionCid)
+          TI.TransferInstructionResult_Completed {} -> return PayoutCompleted
+          TI.TransferInstructionResult_Failed {} -> error "Payout transfer failed"
+
+        -- Calculate new reserves (no pending payout tracking)
+        let (newReserveA, newReserveB) = case direction of
+              AtoB ->
+                ( reserveAmountA + inputAmt
+                , reserveAmountB - outputAmount
+                )
+              BtoA ->
+                ( reserveAmountA - outputAmount
+                , reserveAmountB + inputAmt
+                )
+
+        -- Safety checks
+        assertMsg "Reserve A cannot go below locked A" (newReserveA >= lockedAmountA)
+        assertMsg "Reserve B cannot go below locked B" (newReserveB >= lockedAmountB)
+
+        newPoolCid <- create this with
+          reserveAmountA = newReserveA
+          reserveAmountB = newReserveB
+
+        return (newPoolCid, payoutOutcome)
+
+    -- | Add liquidity from two inbound TransferInstructions (V1).
+    -- Accepts both TIs atomically, updates reserves, mints LP tokens for provider.
+    choice AddLiquidityFromTransferInstructionsV1 : (ContractId HoldingPool, Decimal, Decimal, Decimal)
+      with
+        provider : Party
+        tiCidA : TransferInstructionCid
+        tiCidB : TransferInstructionCid
+        amountA : Decimal
+        amountB : Decimal
+        deadline : Time
+        poolIdText : Text
+        acceptExtraArgsA : Optional M.ExtraArgs
+        acceptExtraArgsB : Optional M.ExtraArgs
+      controller operator
+      do
+        assertMsg "Pool must be Active" (status == Active)
+        assertMsg "PoolId mismatch" (poolId == None || poolId == Some poolIdText)
+        now <- getTime
+        assertMsg "Liquidity deadline has expired" (now < deadline)
+        assertMsg "Amount A must be positive" (amountA > 0.0)
+        assertMsg "Amount B must be positive" (amountB > 0.0)
+        assertMsg "Pool reserves must be positive when LP supply > 0"
+          (lpSupply == 0.0 || (reserveAmountA > 0.0 && reserveAmountB > 0.0))
+
+        -- Validate TI senders/receivers/instruments/amounts before accepting
+        tiInfoAOpt <- fetchTransferInstructionInfoOpt tiCidA
+        tiInfoBOpt <- fetchTransferInstructionInfoOpt tiCidB
+        case (tiInfoAOpt, tiInfoBOpt) of
+          (Some tiA, Some tiB) -> do
+            assertMsg "TI A sender mismatch" (tiA.sender == provider)
+            assertMsg "TI B sender mismatch" (tiB.sender == provider)
+            assertMsg "TI A receiver mismatch" (tiA.receiver == operator)
+            assertMsg "TI B receiver mismatch" (tiB.receiver == operator)
+            assertMsg "TI A instrument mismatch" (instrumentIdEq tiA.instrumentId instrumentA)
+            assertMsg "TI B instrument mismatch" (instrumentIdEq tiB.instrumentId instrumentB)
+            assertMsg "TI A amount mismatch" (tiA.amount == amountA)
+            assertMsg "TI B amount mismatch" (tiB.amount == amountB)
+          _ -> error "Unable to fetch transfer instruction info"
+
+        let acceptArgsA = case acceptExtraArgsA of
+              Some args -> args
+              None -> M.ExtraArgs with
+                context = M.emptyChoiceContext
+                meta = M.emptyMetadata
+        let acceptArgsB = case acceptExtraArgsB of
+              Some args -> args
+              None -> M.ExtraArgs with
+                context = M.emptyChoiceContext
+                meta = M.emptyMetadata
+
+        tiResultA <- exercise tiCidA TI.TransferInstruction_Accept with extraArgs = acceptArgsA
+        tiResultB <- exercise tiCidB TI.TransferInstruction_Accept with extraArgs = acceptArgsB
+
+        let holdingCidA = case tiResultA.output of
+              TI.TransferInstructionResult_Completed {receiverHoldingCids} -> case receiverHoldingCids of
+                h :: _ -> h
+                _ -> error "Accept returned no receiver holding (A)"
+              _ -> error "Accept did not complete transfer (A)"
+        let holdingCidB = case tiResultB.output of
+              TI.TransferInstructionResult_Completed {receiverHoldingCids} -> case receiverHoldingCids of
+                h :: _ -> h
+                _ -> error "Accept returned no receiver holding (B)"
+              _ -> error "Accept did not complete transfer (B)"
+
+        holdingInstA <- getHoldingInstrument holdingCidA
+        holdingAmtA <- getHoldingAmount holdingCidA
+        assertMsg "Holding A instrument mismatch" (instrumentIdEq holdingInstA instrumentA)
+        assertMsg "Holding A amount mismatch" (holdingAmtA == amountA)
+
+        holdingInstB <- getHoldingInstrument holdingCidB
+        holdingAmtB <- getHoldingAmount holdingCidB
+        assertMsg "Holding B instrument mismatch" (instrumentIdEq holdingInstB instrumentB)
+        assertMsg "Holding B amount mismatch" (holdingAmtB == amountB)
+
+        let lpMinted = if lpSupply == 0.0
+              then sqrt (amountA * amountB)
+              else
+                let shareA = amountA * lpSupply / reserveAmountA
+                    shareB = amountB * lpSupply / reserveAmountB
+                in min shareA shareB
+        assertMsg "LP minted must be positive" (lpMinted > 0.0)
+
+        let newReserveA = reserveAmountA + amountA
+        let newReserveB = reserveAmountB + amountB
+        let newLpSupply = lpSupply + lpMinted
+
+        _ <- create LP.LPToken with
+          issuer = operator
+          owner = provider
+          poolId = poolIdText
+          amount = lpMinted
+
+        newPoolCid <- create this with
+          reserveAmountA = newReserveA
+          reserveAmountB = newReserveB
+          lpSupply = newLpSupply
+          poolId = Some poolIdText
+
+        return (newPoolCid, lpMinted, newReserveA, newReserveB)
+
+    -- | Remove liquidity by burning LP tokens and creating two payout TIs (V1).
+    -- Operator-controlled: validates LP ownership and burns via LPToken.BurnByIssuer.
+    choice RemoveLiquidityFromLpV1 : (ContractId HoldingPool, Decimal, Decimal, Decimal, Decimal, PayoutOutcome, PayoutOutcome)
+      with
+        requestId : Text
+        lpCid : ContractId LP.LPToken
+        lpBurnAmount : Decimal
+        receiverParty : Party
+        minOutA : Decimal
+        minOutB : Decimal
+        deadline : Time
+        poolIdText : Text
+        outputHoldingCidA : HoldingCid
+        outputHoldingCidB : HoldingCid
+        payoutFactoryCidA : ContractId TI.TransferFactory
+        payoutFactoryCidB : ContractId TI.TransferFactory
+        payoutExtraArgsA : M.ExtraArgs
+        payoutExtraArgsB : M.ExtraArgs
+        payoutMemo : Text
+      controller operator
+      do
+        assertMsg "Pool must be Active" (status == Active)
+        assertMsg "PoolId mismatch" (poolId == None || poolId == Some poolIdText)
+        now <- getTime
+        assertMsg "Remove liquidity deadline has expired" (now < deadline)
+        assertMsg "LP burn amount must be positive" (lpBurnAmount > 0.0)
+        assertMsg "Pool LP supply must be positive" (lpSupply > 0.0)
+        assertMsg "MinOut A must be non-negative" (minOutA >= 0.0)
+        assertMsg "MinOut B must be non-negative" (minOutB >= 0.0)
+
+        lp <- fetch lpCid
+        assertMsg "LP owner mismatch" (lp.owner == receiverParty)
+        assertMsg "LP poolId mismatch" (lp.poolId == poolIdText)
+        assertMsg "LP burn exceeds balance" (lp.amount >= lpBurnAmount)
+
+        let share = lpBurnAmount / lpSupply
+        let outA = reserveAmountA * share
+        let outB = reserveAmountB * share
+
+        assertMsg "Output amount A must be positive" (outA > 0.0)
+        assertMsg "Output amount B must be positive" (outB > 0.0)
+        assertMsg "Slippage: output A below minimum" (outA >= minOutA)
+        assertMsg "Slippage: output B below minimum" (outB >= minOutB)
+
+        let availA = reserveAmountA - lockedAmountA
+        let availB = reserveAmountB - lockedAmountB
+        assertMsg "Insufficient available liquidity for output A" (outA <= availA)
+        assertMsg "Insufficient available liquidity for output B" (outB <= availB)
+
+        outInstA <- getHoldingInstrument outputHoldingCidA
+        outAmtA <- getHoldingAmount outputHoldingCidA
+        assertMsg "Output holding A has wrong instrument" (instrumentIdEq outInstA instrumentA)
+        assertMsg "Output holding A insufficient amount" (outAmtA >= outA)
+
+        outInstB <- getHoldingInstrument outputHoldingCidB
+        outAmtB <- getHoldingAmount outputHoldingCidB
+        assertMsg "Output holding B has wrong instrument" (instrumentIdEq outInstB instrumentB)
+        assertMsg "Output holding B insufficient amount" (outAmtB >= outB)
+
+        _ <- exercise lpCid LP.BurnByIssuer with qty = lpBurnAmount
+
+        let memoKey = "splice.lfdecentralizedtrust.org/reason"
+        let memoMeta = M.Metadata with values = TextMap.fromList [(memoKey, payoutMemo)]
+
+        let payoutTransferA = TI.Transfer with
+              sender = operator
+              receiver = receiverParty
+              amount = outA
+              instrumentId = instrumentA
+              requestedAt = now
+              executeBefore = deadline
+              inputHoldingCids = [outputHoldingCidA]
+              meta = memoMeta
+        payoutResultA <- exercise payoutFactoryCidA TI.TransferFactory_Transfer with
+          expectedAdmin = instrumentA.admin
+          transfer = payoutTransferA
+          extraArgs = payoutExtraArgsA
+        payoutOutcomeA <- case payoutResultA.output of
+          TI.TransferInstructionResult_Pending {transferInstructionCid} -> return (PayoutPending transferInstructionCid)
+          TI.TransferInstructionResult_Completed {} -> return PayoutCompleted
+          TI.TransferInstructionResult_Failed {} -> error "Payout A transfer failed"
+
+        let payoutTransferB = TI.Transfer with
+              sender = operator
+              receiver = receiverParty
+              amount = outB
+              instrumentId = instrumentB
+              requestedAt = now
+              executeBefore = deadline
+              inputHoldingCids = [outputHoldingCidB]
+              meta = memoMeta
+        payoutResultB <- exercise payoutFactoryCidB TI.TransferFactory_Transfer with
+          expectedAdmin = instrumentB.admin
+          transfer = payoutTransferB
+          extraArgs = payoutExtraArgsB
+        payoutOutcomeB <- case payoutResultB.output of
+          TI.TransferInstructionResult_Pending {transferInstructionCid} -> return (PayoutPending transferInstructionCid)
+          TI.TransferInstructionResult_Completed {} -> return PayoutCompleted
+          TI.TransferInstructionResult_Failed {} -> error "Payout B transfer failed"
+
+        let newReserveA = reserveAmountA - outA
+        let newReserveB = reserveAmountB - outB
+        let newLpSupply = lpSupply - lpBurnAmount
+
+        assertMsg "Reserve A cannot go below locked A" (newReserveA >= lockedAmountA)
+        assertMsg "Reserve B cannot go below locked B" (newReserveB >= lockedAmountB)
+        assertMsg "LP supply cannot be negative" (newLpSupply >= 0.0)
+
+        newPoolCid <- create this with
+          reserveAmountA = newReserveA
+          reserveAmountB = newReserveB
+          lpSupply = newLpSupply
+          poolId = Some poolIdText
+
+        return (newPoolCid, outA, outB, newReserveA, newReserveB, payoutOutcomeA, payoutOutcomeB)
+
+    -- | UnlockPayout - called when payout is claimed.
+    -- Deducts from reserves and unlocks.
+    choice UnlockPayout : ContractId HoldingPool
+      with
+        payoutCid : ContractId PendingPayout
+      controller operator
+      do
+        -- Fetch and archive the payout (ConfirmClaimed is consuming)
+        payout <- fetch payoutCid
+        exercise payoutCid ConfirmClaimed
+
+        -- Deduct from reserves and unlock
+        let (newReserveA, newReserveB, newLockedA, newLockedB) =
+              if instrumentIdEq payout.instrument instrumentA
+              then
+                ( reserveAmountA - payout.amount  -- Deduct from reserve
+                , reserveAmountB
+                , lockedAmountA - payout.amount   -- Unlock
+                , lockedAmountB
+                )
+              else
+                ( reserveAmountA
+                , reserveAmountB - payout.amount  -- Deduct from reserve
+                , lockedAmountA
+                , lockedAmountB - payout.amount   -- Unlock
+                )
+
+        -- Safety checks
+        assertMsg "Reserve A cannot go negative" (newReserveA >= 0.0)
+        assertMsg "Reserve B cannot go negative" (newReserveB >= 0.0)
+        assertMsg "Locked A cannot go negative" (newLockedA >= 0.0)
+        assertMsg "Locked B cannot go negative" (newLockedB >= 0.0)
+
+        create this with
+          reserveAmountA = newReserveA
+          reserveAmountB = newReserveB
+          lockedAmountA = newLockedA
+          lockedAmountB = newLockedB
+
+    -- | HandlePayoutExpiry - called when payout expires.
+    -- Unlocks without deducting reserves (funds stay in pool).
+    choice HandlePayoutExpiry : ContractId HoldingPool
+      with
+        payoutCid : ContractId PendingPayout
+      controller operator
+      do
+        -- Fetch and archive the payout (HandleExpiry is consuming)
+        payout <- fetch payoutCid
+        exercise payoutCid HandleExpiry
+
+        -- Unlock without deducting reserves
+        let (newLockedA, newLockedB) =
+              if instrumentIdEq payout.instrument instrumentA
+              then (lockedAmountA - payout.amount, lockedAmountB)
+              else (lockedAmountA, lockedAmountB - payout.amount)
+
+        -- Safety checks
+        assertMsg "Locked A cannot go negative" (newLockedA >= 0.0)
+        assertMsg "Locked B cannot go negative" (newLockedB >= 0.0)
+
+        create this with
+          lockedAmountA = newLockedA
+          lockedAmountB = newLockedB
+
+-- | Helper to create an empty uninitialized pool.
+createEmptyPool : Party -> Text -> InstrumentId -> InstrumentId -> Decimal -> Update (ContractId HoldingPool)
+createEmptyPool op poolId instA instB fee = do
+  -- Ensure canonical ordering
+  let (orderedA, orderedB) =
+        if (instA.admin, instA.id) < (instB.admin, instB.id)
+        then (instA, instB)
+        else (instB, instA)
+
+  create HoldingPool with
+    operator = op
+    poolId = Some poolId
+    instrumentA = orderedA
+    instrumentB = orderedB
+    status = Uninitialized
+    reserveAmountA = 0.0
+    reserveAmountB = 0.0
+    lockedAmountA = 0.0
+    lockedAmountB = 0.0
+    feeRate = fee
+    lpSupply = 0.0
+

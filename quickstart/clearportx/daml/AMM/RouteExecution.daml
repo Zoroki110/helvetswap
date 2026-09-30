@@ -1,0 +1,4 @@
+module AMM.RouteExecution where
+
+-- Stub module to satisfy upgrade checks
+-- Original module removed in 1.0.28; this maintains package structure compatibility

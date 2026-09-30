@@ -1,0 +1,23 @@
+module TokenStandardAdapter where
+
+import qualified Splice.Api.Token.HoldingV1 as Holding
+import qualified Splice.Api.Token.MetadataV1 as Metadata
+
+-- PHASE 2 READ-ONLY CIP-0056/CIP-0089
+-- NO create/exercise allowed
+-- This module only re-exports the read-only types required by the backend to
+-- query Holding and Metadata interfaces. There are intentionally no templates
+-- or choices here to avoid any accidental ledger mutations.
+
+data HoldingSnapshot = HoldingSnapshot
+  with owner : Party
+       instrumentId : Holding.InstrumentId
+       amount : Decimal
+       lock : Optional Holding.Lock
+       metadata : Metadata.Metadata
+  deriving (Eq, Show)
+
+holdingViewToSnapshot : Holding.HoldingView -> HoldingSnapshot
+holdingViewToSnapshot view =
+  let Holding.HoldingView {owner, instrumentId, amount, lock, meta} = view
+  in HoldingSnapshot with owner, instrumentId, amount, lock, metadata = meta

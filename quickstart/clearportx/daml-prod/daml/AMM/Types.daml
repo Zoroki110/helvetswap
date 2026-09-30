@@ -1,0 +1,14 @@
+module AMM.Types where
+
+-- Constantes pour l'AMM
+eps : Numeric 10
+eps = 0.000001
+
+minLiquidity : Numeric 10
+minLiquidity = 0.001
+
+maxDec : Numeric 10
+maxDec = 9999999999.9999999999
+
+minAmount : Numeric 10
+minAmount = 0.01

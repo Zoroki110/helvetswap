@@ -1,0 +1,83 @@
+-- | Adapter module for Splice Token Standard types.
+-- Provides type aliases and helper functions for working with Holdings and TransferInstructions.
+module AMM.HoldingAdapter where
+
+import qualified Splice.Api.Token.HoldingV1 as H
+import qualified Splice.Api.Token.TransferInstructionV1 as TI
+
+-- Re-export InstrumentId for convenience
+type InstrumentId = H.InstrumentId
+
+-- Type aliases for contract IDs
+type HoldingCid = ContractId H.Holding
+type TransferInstructionCid = ContractId TI.TransferInstruction
+
+-- | Create an InstrumentId from admin party and text id.
+mkInstrumentId : Party -> Text -> InstrumentId
+mkInstrumentId admin id = H.InstrumentId with admin, id
+
+-- | Compare two InstrumentIds for equality.
+instrumentIdEq : InstrumentId -> InstrumentId -> Bool
+instrumentIdEq a b = a.admin == b.admin && a.id == b.id
+
+-- | Get the instrument id text from an InstrumentId.
+getInstrumentIdText : InstrumentId -> Text
+getInstrumentIdText iid = iid.id
+
+-- | Get the admin party from an InstrumentId.
+getInstrumentAdmin : InstrumentId -> Party
+getInstrumentAdmin iid = iid.admin
+
+-- | Result of fetching holding info - returns Optional to avoid partial functions.
+data HoldingInfo = HoldingInfo
+  with
+    owner : Party
+    instrumentId : InstrumentId
+    amount : Decimal
+  deriving (Eq, Show)
+
+fetchHoldingInfoOpt : HoldingCid -> Update (Optional HoldingInfo)
+fetchHoldingInfoOpt cid = do
+  holding <- fetch cid
+  -- Uses `view` (standard interface view accessor) on H.Holding.
+  let hv = view holding
+  return $ Some $ HoldingInfo with
+    owner = hv.owner
+    instrumentId = hv.instrumentId
+    amount = hv.amount
+
+-- | Get the amount contained in a holding.
+getHoldingAmount : HoldingCid -> Update Decimal
+getHoldingAmount cid = do
+  holding <- fetch cid
+  -- Uses `view` to extract amount.
+  return (view holding).amount
+
+-- | Get the instrument identifier of a holding.
+getHoldingInstrument : HoldingCid -> Update InstrumentId
+getHoldingInstrument cid = do
+  holding <- fetch cid
+  -- Uses `view` to extract instrumentId.
+  return (view holding).instrumentId
+
+-- | TransferInstruction view data for our use.
+data TransferInstructionInfo = TransferInstructionInfo
+  with
+    sender : Party
+    receiver : Party
+    amount : Decimal
+    instrumentId : InstrumentId
+  deriving (Eq, Show)
+
+-- | Fetch transfer instruction information safely.
+fetchTransferInstructionInfoOpt : TransferInstructionCid -> Update (Optional TransferInstructionInfo)
+fetchTransferInstructionInfoOpt cid = do
+  ti <- fetch cid
+  -- Uses `view` on TI.TransferInstruction interface to read transfer fields.
+  let tiv = view ti
+  let t = tiv.transfer
+  return $ Some $ TransferInstructionInfo with
+    sender = t.sender
+    receiver = t.receiver
+    amount = t.amount
+    instrumentId = t.instrumentId

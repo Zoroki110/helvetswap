@@ -1,0 +1,55 @@
+-- | PendingPayout template for tracking outbound transfer instructions.
+-- Created when pool creates a TI to send output tokens to user.
+-- FIX5: ConfirmClaimed and HandleExpiry are CONSUMING choices.
+module AMM.PendingPayout where
+
+import AMM.HoldingAdapter (InstrumentId, TransferInstructionCid)
+import AMM.SwapIntent (PoolKey)
+
+-- | PendingPayout tracks an outbound TransferInstruction from pool to user.
+-- When the user accepts the TI (off-ledger via Loop wallet), the backend
+-- calls ConfirmClaimed to archive this and update pool reserves.
+template PendingPayout
+  with
+    operator : Party                       -- Pool operator
+    recipient : Party                      -- User receiving the payout
+    outputTiCid : TransferInstructionCid   -- The outbound TI created by pool
+    amount : Decimal                       -- Amount being paid out
+    instrument : InstrumentId              -- Instrument being paid out
+    poolKey : PoolKey                      -- Which pool this payout is from
+    createdAt : Time                       -- When payout was created
+    expiresAt : Time                       -- When payout expires (24h typical)
+  where
+    signatory operator
+    observer recipient
+
+    ensure
+      amount > 0.0 &&
+      expiresAt > createdAt
+
+    -- | FIX5: ConfirmClaimed is CONSUMING.
+    -- Called when recipient has claimed the TI (accepted it via their wallet).
+    -- This archives the PendingPayout and signals pool to deduct from reserves.
+    choice ConfirmClaimed : ()
+      controller operator
+      do
+        -- Just archive - the pool will handle reserve updates
+        return ()
+
+    -- | FIX5: HandleExpiry is CONSUMING.
+    -- Called when the TI expires without being claimed.
+    -- This unlocks the reserved amount in the pool without deducting reserves.
+    choice HandleExpiry : ()
+      controller operator
+      do
+        now <- getTime
+        assertMsg "Cannot handle expiry before expiration time" (now >= expiresAt)
+        -- Just archive - the pool will handle unlocking
+        return ()
+
+    -- | Check if this payout has expired.
+    nonconsuming choice IsExpired : Bool
+      controller operator
+      do
+        now <- getTime
+        return (now >= expiresAt)

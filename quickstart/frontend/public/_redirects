@@ -1,0 +1,11 @@
+# Serve static assets directly (do NOT redirect to index.html)
+/static/*  /static/:splat  200
+/manifest.json  /manifest.json  200
+/favicon.ico  /favicon.ico  200
+/robots.txt  /robots.txt  200
+/*.svg  /:splat  200
+/*.png  /:splat  200
+/*.ico  /:splat  200
+
+# SPA fallback: all other routes go to index.html for React Router
+/*    /index.html   200

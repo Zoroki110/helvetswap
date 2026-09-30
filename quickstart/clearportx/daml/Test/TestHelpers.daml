@@ -1,0 +1,62 @@
+module Test.TestHelpers where
+
+import Daml.Script
+import DA.Time
+import qualified Token.Token as T
+import qualified AMM.Pool as P
+import qualified LPToken.LPToken as LP
+
+-- Helper: Create pool with initial liquidity (proper way for new architecture)
+-- This ensures pools have actual token CIDs (not just reserves) which is required for swaps
+createPoolWithLiquidity : Party -> Party -> Party -> Party -> Party -> Party -> Party -> Text -> Text -> Numeric 10 -> Numeric 10 -> Script (ContractId P.Pool)
+createPoolWithLiquidity poolOperator poolParty lpIssuer issuerA issuerB provider clearportx symbolA symbolB amountA amountB = do
+  -- Create empty pool
+  emptyPool <- submit poolOperator $ createCmd P.Pool with
+    poolOperator = poolOperator
+    poolParty = poolParty
+    lpIssuer = lpIssuer
+    issuerA = issuerA
+    issuerB = issuerB
+    symbolA = symbolA
+    symbolB = symbolB
+    feeBps = 30
+    poolId = symbolA <> "-" <> symbolB
+    maxTTL = seconds 120
+    totalLPSupply = 0.0
+    reserveA = 0.0
+    reserveB = 0.0
+    tokenACid = None
+    tokenBCid = None
+    protocolFeeReceiver = clearportx
+    maxInBps = 10000
+    maxOutBps = 5000
+    extraObservers = []
+
+  -- Create tokens for provider
+  tokenA <- submit issuerA $ createCmd T.Token with
+    issuer = issuerA
+    owner = provider
+    symbol = symbolA
+    amount = amountA
+
+  tokenB <- submit issuerB $ createCmd T.Token with
+    issuer = issuerB
+    owner = provider
+    symbol = symbolB
+    amount = amountB
+
+  -- Add liquidity
+  now <- getTime
+  let deadline = addRelTime now (seconds 60)
+
+  (_, poolWithLiquidity) <- submitMulti [provider, poolParty, lpIssuer] [] $
+    exerciseCmd emptyPool P.AddLiquidity with
+      provider = provider
+      tokenACid = tokenA
+      tokenBCid = tokenB
+      amountA = amountA
+      amountB = amountB
+      minLPTokens = 0.0
+      deadline = deadline
+
+  return poolWithLiquidity

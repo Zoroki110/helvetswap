@@ -1,0 +1,106 @@
+# ClearportX / HelvetSwap Backend - MainNet Production Configuration
+
+spring:
+  application:
+    name: clearportx-backend
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.orm.jpa.HibernateJpaAutoConfiguration
+
+# Feature flags — required for swap payout path (template schema / choice inspection)
+feature:
+  enable-template-schema-debug: true
+
+# CORS Configuration (MainNet prod — canonical domains + Vercel previews)
+cors:
+  allowed-origins: ${CORS_ALLOWED_ORIGINS:https://helvetswap.app,https://www.helvetswap.app,https://helvetswap.com}
+  allowed-origin-patterns: ${CORS_ALLOWED_ORIGIN_PATTERNS:https://helvetswap-mainnet*.vercel.app}
+  allow-credentials: true
+  allowed-methods: GET,POST,PUT,DELETE,OPTIONS,HEAD
+
+# Rate Limiter (higher throughput for production)
+rate-limiter:
+  enabled: true
+  distributed: true
+  global-max-per-5s: 10
+  party-max-per-min: 30
+  redis-key-ttl: 6
+
+# PQS Configuration (production pool)
+# Canton 3.5 package-NAME reference (transposes patch 17 / DevNet a018f7bd).
+# QUOTED — an unquoted # is a YAML comment and the key would silently resolve to null.
+# ★ ENV OVERRIDES YAML: the live backend pins HOLDINGPOOL_PACKAGE_ID in its launch env;
+# any restart must export it as "#helvet-amm" or not export it at all — carrying the old
+# hex forward silently defeats this key (see Stage-1 §5a).
+holdingpool:
+  package-id: "#helvet-amm"
+
+pqs:
+  pool-size: 30
+  sync-timeout-ms: 30000
+  stale-retry-max-attempts: 3
+  stale-retry-delay-ms: 1000
+
+# Logging (less verbose in production)
+logging:
+  level:
+    root: WARN
+    com.digitalasset.quickstart: INFO
+    org.springframework.security: WARN
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} [requestId=%X{requestId}] - %msg%n"
+
+# Application-Specific Configuration
+clearportx:
+  auth:
+    jwt-secret: ${CLEARPORTX_AUTH_JWT_SECRET}
+    jwt-issuer: ${CLEARPORTX_AUTH_JWT_ISSUER:clearportx-backend}
+  security:
+    require-request-id: true
+    require-idempotency-key: true
+    validate-body-hash: true
+  liquidity:
+    poller:
+      # LP-PHASE-2 inbound-TI addLiquidity poller. Prod default OFF (deploy-neutral);
+      # enable via env LIQUIDITY_POLLER_ENABLED=true + restart (MainNet-Mind deploy concern).
+      enabled: ${LIQUIDITY_POLLER_ENABLED:false}
+      interval-ms: ${LIQUIDITY_POLLER_INTERVAL_MS:5000}
+      max-age-seconds: ${LIQUIDITY_POLLER_MAX_AGE_SECONDS:300}
+
+  # Cure (iv): auto-accept incoming CBTC TransferOffers (operator as receiver).
+  # ★ PROD MUST STAY false (binding, handoff §4): beyond the operator risk sign-off,
+  # CbtcAutoAcceptService constructor-requires DevNetTransferInstructionController which is
+  # @Profile("devnet") on MainNet → flipping this flag on prod CRASHES the context at startup.
+  # Enabling requires a CODE change (prod-available accept path) FIRST.
+  cbtc-auto-accept:
+    enabled: ${CBTC_AUTO_ACCEPT_ENABLED:false}
+    poll-interval-ms: ${CBTC_AUTO_ACCEPT_POLL_INTERVAL_MS:30000}
+    min-amount: ${CBTC_AUTO_ACCEPT_MIN_AMOUNT:0.00000001}
+
+# CIP-0104 Featured App Activity Markers
+# Enable once DSO grants FeaturedAppRight to the app provider party
+featured-app:
+  enabled: ${FEATURED_APP_ENABLED:false}
+  # Set to MainNet app-provider party id (app-provider-<hex8>::1220<hex64>) before Phase 2 deploy
+  provider-party: ${FEATURED_APP_PROVIDER_PARTY:}
+
+# Phase 3F.10 Step B — ScanOmrCache config (transposed from patches 06+08, kebab-case final form).
+# INERT ON PROD today: both consuming beans are @Profile("devnet"); OMRRefresh injects
+# Optional<ScanOmrCache> (empty on prod). Carried for parity + a future MainNet activation dispatch.
+scan-omr:
+  cache:
+    poll-interval-ms: 2000
+    bootstrap-max-retries: 5
+    bootstrap-retry-backoff-ms: 1000
+    stale-warning-threshold-sec: 30
+    fail-open-after-stale-sec: 60
+
+# Ledger / Registry Routing for MainNet
+# Validator gateway scan-proxy (requires HMAC-256 JWT auth via LEDGER_REGISTRY_AUTH_TOKEN)
+ledger:
+  registry-base-uri: ${LEDGER_REGISTRY_BASE_URI:http://localhost:8888/api/validator/v0/scan-proxy}
+  registry:
+    default-base-uri: ${LEDGER_REGISTRY_DEFAULT_BASE_URI:http://localhost:8888/api/validator/v0/scan-proxy}
+    fallback-base-uris: ${LEDGER_REGISTRY_FALLBACK_BASE_URIS:https://scan.sv-2.global.canton.network.sync.global}
+    by-admin: ${LEDGER_REGISTRY_BY_ADMIN:{}}

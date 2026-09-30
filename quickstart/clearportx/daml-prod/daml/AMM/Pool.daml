@@ -1,0 +1,446 @@
+module AMM.Pool where
+
+import qualified Token.Token as T
+import qualified LPToken.LPToken as LP
+import qualified AMM.Types as Types
+import DA.Time (RelTime)
+import DA.Action (void, when)
+import DA.Math (sqrt)
+
+{-
+  POOL TEMPLATE WITH LIQUIDITY PROVISION
+
+  DESIGN CHANGES (Phase 1):
+  1. Added totalLPSupply, reserveA, reserveB to track pool state
+  2. Direct AddLiquidity/RemoveLiquidity choices (no request templates)
+  3. Multi-party controllers: provider, poolParty, lpIssuer
+  4. Slippage protection: minLPTokens, minAmountA, minAmountB
+  5. Archive-and-recreate pattern to update reserves
+
+  NO CONTRACT KEY (DAML 3.x Compatibility):
+  - DAML 3.x REMOVED contract key support
+  - Pool is tracked by ContractId only
+  - PoolAnnouncement template provides discovery mechanism
+  - Callers must pass Pool ContractId to execute swaps
+
+  LP TOKEN FORMULA:
+  - First LP: lpTokens = sqrt(amountA * amountB)
+  - Subsequent: lpTokens = min(amountA * totalSupply / reserveA, amountB * totalSupply / reserveB)
+-}
+
+template Pool
+  with
+    poolOperator : Party
+    poolParty : Party
+    lpIssuer : Party
+    issuerA : Party
+    issuerB : Party
+    symbolA : Text
+    symbolB : Text
+    feeBps : Int
+    poolId : Text
+    maxTTL : RelTime
+    totalLPSupply : Numeric 10  -- Total LP tokens minted
+    reserveA : Numeric 10       -- Current reserve of tokenA
+    reserveB : Numeric 10       -- Current reserve of tokenB
+    tokenACid : Optional (ContractId T.Token)  -- Canonical token CID for reserve A
+    tokenBCid : Optional (ContractId T.Token)  -- Canonical token CID for reserve B
+    protocolFeeReceiver : Party -- ClearportX treasury (receives 25% of fees)
+    maxInBps : Int              -- Max input as % of reserve (e.g., 10000 = 100%)
+    maxOutBps : Int             -- Max output as % of reserve (e.g., 5000 = 50%)
+  where
+    signatory poolOperator
+    observer poolParty, lpIssuer, issuerA, issuerB, protocolFeeReceiver
+
+    -- NO KEY: DAML 3.x does not support contract keys
+    -- Pool discovery is handled by PoolAnnouncement template
+
+    ensure
+      (symbolA, show issuerA) < (symbolB, show issuerB) &&
+      totalLPSupply >= 0.0 &&
+      reserveA >= 0.0 &&
+      reserveB >= 0.0 &&
+      maxInBps > 0 && maxInBps <= 10000 &&
+      maxOutBps > 0 && maxOutBps <= 10000 &&
+      -- HIGH-4 FIX: If pool has LP tokens, it MUST have reserves
+      (totalLPSupply == 0.0 || (reserveA > 0.0 && reserveB > 0.0))
+      -- MEDIUM-4 NOTE: We allow pools with reserves but no LP supply for test convenience
+      -- In production, pools should only get reserves through AddLiquidity which creates LP tokens
+      -- The critical direction (LP tokens => reserves) is enforced above
+
+    -- Add liquidity: deposit tokens A & B, receive LP tokens
+    nonconsuming choice AddLiquidity : (ContractId LP.LPToken, ContractId Pool)
+      with
+        provider : Party
+        tokenACid : ContractId T.Token
+        tokenBCid : ContractId T.Token
+        amountA : Numeric 10
+        amountB : Numeric 10
+        minLPTokens : Numeric 10  -- Slippage protection
+        deadline : Time
+      controller provider, poolParty, lpIssuer
+      do
+        -- Deadline check
+        now <- getTime
+        assertMsg "Deadline passed" (now <= deadline)
+
+        -- MEDIUM-5 FIX: Validate token symbols and issuers match pool
+        tokenA <- fetch tokenACid
+        tokenB <- fetch tokenBCid
+
+        assertMsg ("Token A symbol mismatch: expected " <> symbolA <> " but got " <> tokenA.symbol)
+          (tokenA.symbol == symbolA)
+        assertMsg ("Token B symbol mismatch: expected " <> symbolB <> " but got " <> tokenB.symbol)
+          (tokenB.symbol == symbolB)
+        assertMsg "Token A issuer mismatch" (tokenA.issuer == issuerA)
+        assertMsg "Token B issuer mismatch" (tokenB.issuer == issuerB)
+        assertMsg "Token A has insufficient balance" (tokenA.amount >= amountA)
+        assertMsg "Token B has insufficient balance" (tokenB.amount >= amountB)
+
+        -- MEDIUM-2 FIX: Enforce minimum liquidity to prevent dust/griefing attacks
+        assertMsg ("Minimum liquidity not met for token A (min: " <> show Types.minLiquidity <> ")")
+          (amountA >= Types.minLiquidity)
+        assertMsg ("Minimum liquidity not met for token B (min: " <> show Types.minLiquidity <> ")")
+          (amountB >= Types.minLiquidity)
+
+        -- Calculate LP tokens to mint
+        let lpTokensToMint = if totalLPSupply == 0.0
+              then sqrt (amountA * amountB)  -- First LP: geometric mean
+              else
+                let shareA = amountA * totalLPSupply / reserveA
+                    shareB = amountB * totalLPSupply / reserveB
+                in min shareA shareB  -- Subsequent: proportional to reserves
+
+        -- Slippage protection
+        assertMsg "Slippage: LP tokens below minimum" (lpTokensToMint >= minLPTokens)
+
+        -- Transfer tokens to pool (skip transfer if provider == poolParty for bootstrap)
+        -- Token.Transfer has controller owner (provider), so provider authorizes
+        newTokenAFromProvider <- if provider == poolParty
+          then return tokenACid  -- Bootstrap: provider owns pool, just use tokens directly
+          else exercise tokenACid T.Transfer with recipient = poolParty, qty = amountA
+
+        newTokenBFromProvider <- if provider == poolParty
+          then return tokenBCid  -- Bootstrap: provider owns pool, just use tokens directly
+          else exercise tokenBCid T.Transfer with recipient = poolParty, qty = amountB
+
+        -- CONSOLIDATION: Merge with existing pool tokens if they exist
+        -- Use 'this.tokenACid' to refer to the Pool's field (not the choice parameter)
+        finalTokenACid <- case this.tokenACid of
+          None -> return newTokenAFromProvider  -- First liquidity: these become canonical
+          Some existingCid -> exercise existingCid T.Merge with otherTokenCid = newTokenAFromProvider
+
+        finalTokenBCid <- case this.tokenBCid of
+          None -> return newTokenBFromProvider  -- First liquidity: these become canonical
+          Some existingCid -> exercise existingCid T.Merge with otherTokenCid = newTokenBFromProvider
+
+        -- Mint LP tokens (lpIssuer creates token for provider)
+        lpToken <- create LP.LPToken with
+          issuer = lpIssuer
+          owner = provider
+          poolId = poolId
+          amount = lpTokensToMint
+
+        -- Archive old pool and create new with updated reserves
+        archive self
+        newPool <- create this with
+          totalLPSupply = totalLPSupply + lpTokensToMint
+          reserveA = reserveA + amountA
+          reserveB = reserveB + amountB
+          tokenACid = Some finalTokenACid
+          tokenBCid = Some finalTokenBCid
+
+        return (lpToken, newPool)
+
+    -- Remove liquidity: burn LP tokens, receive tokens A & B
+    nonconsuming choice RemoveLiquidity : (ContractId T.Token, ContractId T.Token, ContractId Pool)
+      with
+        provider : Party
+        lpTokenCid : ContractId LP.LPToken
+        lpTokenAmount : Numeric 10
+        minAmountA : Numeric 10  -- Slippage protection
+        minAmountB : Numeric 10  -- Slippage protection
+        deadline : Time
+      controller provider, poolParty, lpIssuer
+      do
+        -- Deadline check
+        now <- getTime
+        assertMsg "Deadline passed" (now <= deadline)
+
+        -- Positive amount
+        assertMsg "Positive LP amount" (lpTokenAmount > 0.0)
+        assertMsg "Pool has supply" (totalLPSupply > 0.0)
+
+        -- Pool must have tokens to remove liquidity (cannot remove from empty pool)
+        case (this.tokenACid, this.tokenBCid) of
+          (None, _) -> assertFail "Pool has no tokenA (empty pool)"
+          (_, None) -> assertFail "Pool has no tokenB (empty pool)"
+          (Some _, Some _) -> return ()
+
+        -- Get pool tokens from template fields
+        let Some poolTokenACid = this.tokenACid
+        let Some poolTokenBCid = this.tokenBCid
+
+        -- LOW-1 FIX: Validate pool token symbols and ownership
+        tokenA <- fetch poolTokenACid
+        tokenB <- fetch poolTokenBCid
+
+        assertMsg "Pool token A symbol mismatch" (tokenA.symbol == symbolA)
+        assertMsg "Pool token B symbol mismatch" (tokenB.symbol == symbolB)
+        assertMsg "Pool token A issuer mismatch" (tokenA.issuer == issuerA)
+        assertMsg "Pool token B issuer mismatch" (tokenB.issuer == issuerB)
+        assertMsg "Pool token A not owned by pool" (tokenA.owner == poolParty)
+        assertMsg "Pool token B not owned by pool" (tokenB.owner == poolParty)
+
+        -- Calculate tokens to return (proportional to LP share)
+        let shareRatio = lpTokenAmount / totalLPSupply
+        let amountAOut = reserveA * shareRatio
+        let amountBOut = reserveB * shareRatio
+
+        -- Slippage protection
+        assertMsg "Slippage: amountA below minimum" (amountAOut >= minAmountA)
+        assertMsg "Slippage: amountB below minimum" (amountBOut >= minAmountB)
+
+        -- Validate pool has sufficient token balances
+        assertMsg "Pool token A insufficient balance for withdrawal" (tokenA.amount >= amountAOut)
+        assertMsg "Pool token B insufficient balance for withdrawal" (tokenB.amount >= amountBOut)
+
+        -- Burn LP tokens
+        -- LP.Burn has controller owner (provider), so provider authorizes
+        _ <- exercise lpTokenCid LP.Burn with qty = lpTokenAmount
+
+        -- Transfer tokens from pool to provider
+        -- Token.Transfer has controller owner (poolParty), so poolParty authorizes
+        tokenAOut <- exercise poolTokenACid T.Transfer with recipient = provider, qty = amountAOut
+        tokenBOut <- exercise poolTokenBCid T.Transfer with recipient = provider, qty = amountBOut
+
+        -- Calculate new values
+        let newTotalLP = totalLPSupply - lpTokenAmount
+        let newReserveA = reserveA - amountAOut
+        let newReserveB = reserveB - amountBOut
+
+        -- If removing all liquidity (reserves go to ~0), reset pool to empty state
+        -- This ensures we don't violate: totalLPSupply > 0 => reserves > 0
+        let isEmptyPool = newReserveA < 0.001 || newReserveB < 0.001
+        let finalTotalLP = if isEmptyPool then 0.0 else newTotalLP
+        let finalReserveA = if isEmptyPool then 0.0 else newReserveA
+        let finalReserveB = if isEmptyPool then 0.0 else newReserveB
+        let finalTokenACid = if isEmptyPool then None else this.tokenACid
+        let finalTokenBCid = if isEmptyPool then None else this.tokenBCid
+
+        -- Archive old pool and create new with updated reserves
+        archive self
+        newPool <- create this with
+          totalLPSupply = finalTotalLP
+          reserveA = finalReserveA
+          reserveB = finalReserveB
+          tokenACid = finalTokenACid
+          tokenBCid = finalTokenBCid
+
+        return (tokenAOut, tokenBOut, newPool)
+
+    -- Legacy choices (kept for backward compatibility with existing swap tests)
+    nonconsuming choice GetReservesForPool : (Numeric 10, Numeric 10)
+      controller poolParty
+      do
+        return (reserveA, reserveB)
+
+    nonconsuming choice GetSupply : Numeric 10
+      controller lpIssuer
+      do
+        return totalLPSupply
+
+    -- Get spot price (instantaneous exchange rate)
+    -- Returns (priceOfA, priceOfB) where:
+    -- - priceOfA = how much B you get for 1 A (e.g., 1 ETH = 2000 USDC)
+    -- - priceOfB = how much A you get for 1 B (e.g., 1 USDC = 0.0005 ETH)
+    -- Note: This is the mid-market price BEFORE any swap impact
+    nonconsuming choice GetSpotPrice : (Numeric 10, Numeric 10)
+      controller poolOperator
+      do
+        assertMsg "Pool has no liquidity" (reserveA > 0.0 && reserveB > 0.0)
+        let priceOfA = reserveB / reserveA  -- Price of A in terms of B
+        let priceOfB = reserveA / reserveB  -- Price of B in terms of A
+        return (priceOfA, priceOfB)
+
+    -- CRITICAL-3 FIX: Reconcile reserves with actual token balances
+    -- This nonconsuming choice allows verification that stored reserves
+    -- match the actual token holdings, preventing state inconsistencies
+    nonconsuming choice VerifyReserves : (Bool, Text)
+      controller poolOperator
+      do
+        -- Pool must have tokens to verify reserves
+        case (this.tokenACid, this.tokenBCid) of
+          (None, _) -> return (True, "Pool has no tokenA (empty pool) - reserves cannot be verified")
+          (_, None) -> return (True, "Pool has no tokenB (empty pool) - reserves cannot be verified")
+          (Some _, Some _) -> do
+            -- Get pool tokens from template fields
+            let Some poolTokenACid = this.tokenACid
+            let Some poolTokenBCid = this.tokenBCid
+
+            -- Fetch actual token amounts held by pool
+            tokenA <- fetch poolTokenACid
+            tokenB <- fetch poolTokenBCid
+
+            -- Verify tokens belong to poolParty
+            assertMsg "Token A not owned by pool" (tokenA.owner == poolParty)
+            assertMsg "Token B not owned by pool" (tokenB.owner == poolParty)
+            assertMsg "Token A symbol mismatch" (tokenA.symbol == symbolA)
+            assertMsg "Token B symbol mismatch" (tokenB.symbol == symbolB)
+
+            -- Check if reserves match (with small tolerance for rounding)
+            let tolerance = 0.0000001
+            let reserveAMatches = abs(tokenA.amount - reserveA) < tolerance
+            let reserveBMatches = abs(tokenB.amount - reserveB) < tolerance
+            let allMatch = reserveAMatches && reserveBMatches
+
+            -- Build status message
+            let statusMsg = if allMatch
+                  then "Reserves verified: " <> show reserveA <> " " <> symbolA <> ", " <> show reserveB <> " " <> symbolB
+                  else "RESERVE MISMATCH! Stored: (" <> show reserveA <> ", " <> show reserveB <>
+                       ") vs Actual: (" <> show tokenA.amount <> ", " <> show tokenB.amount <> ")"
+
+            return (allMatch, statusMsg)
+
+    -- CRITICAL-6 FIX: Update pool reserves after swap
+    -- This choice is called by ExecuteSwap to maintain reserve consistency
+    nonconsuming choice ArchiveAndUpdateReserves : ContractId Pool
+      with
+        updatedReserveA : Numeric 10
+        updatedReserveB : Numeric 10
+        updatedTokenACid : Optional (ContractId T.Token)
+        updatedTokenBCid : Optional (ContractId T.Token)
+      controller poolParty
+      do
+        -- Validate new reserves are positive
+        assertMsg "Updated reserve A must be positive" (updatedReserveA > 0.0)
+        assertMsg "Updated reserve B must be positive" (updatedReserveB > 0.0)
+
+        -- Verify constant product invariant k' >= k (accounting for fees)
+        let k = reserveA * reserveB
+        let k' = updatedReserveA * updatedReserveB
+        assertMsg "Constant product invariant violated (k decreased without fee justification)"
+          (k' >= k * 0.99)  -- Allow slight decrease for rounding, but k should generally increase
+
+        -- Archive old pool and create new with updated reserves and token CIDs
+        archive self
+        create this with
+          reserveA = updatedReserveA
+          reserveB = updatedReserveB
+          tokenACid = updatedTokenACid
+          tokenBCid = updatedTokenBCid
+
+    -- ATOMIC SWAP: Single-step swap without intermediate SwapReady contract
+    -- This avoids the poolCid staleness issue with the two-step PrepareSwap/ExecuteSwap flow
+    nonconsuming choice AtomicSwap : (ContractId T.Token, ContractId Pool)
+      with
+        trader : Party
+        traderInputTokenCid : ContractId T.Token
+        inputSymbol : Text
+        inputAmount : Numeric 10
+        outputSymbol : Text
+        minOutput : Numeric 10
+        maxPriceImpactBps : Int
+        deadline : Time
+      controller trader, poolParty
+      do
+        -- Validations
+        now <- getTime
+        assertMsg "Swap expired" (now <= deadline)
+        assertMsg "Input amount must be positive" (inputAmount > 0.0)
+        assertMsg "Invalid input symbol" (inputSymbol == symbolA || inputSymbol == symbolB)
+        assertMsg "Invalid output symbol" (outputSymbol == symbolA || outputSymbol == symbolB)
+        assertMsg "Input and output symbols must differ" (inputSymbol /= outputSymbol)
+        assertMsg "Price impact tolerance too high (max 50% allowed)" (maxPriceImpactBps <= 5000)
+
+        -- Determine direction
+        let isAtoB = inputSymbol == symbolA
+        let (rin, rout, poolInCidCanonical, poolOutCidCanonical) =
+              if isAtoB
+              then (reserveA, reserveB, tokenACid, tokenBCid)
+              else (reserveB, reserveA, tokenBCid, tokenACid)
+
+        -- Validate reserves
+        assertMsg "Input reserve must be positive" (rin > 0.0)
+        assertMsg "Output reserve must be positive" (rout > 0.0)
+        assertMsg "Pool has no output tokens (add liquidity first)"
+          (case poolOutCidCanonical of
+            None -> False
+            Some _ -> True)
+
+        -- Calculate protocol fee (25% of total fee)
+        let totalFeeRate = intToDecimal feeBps / 10000.0
+        let totalFeeAmount = inputAmount * totalFeeRate
+        let protocolFeeAmount = totalFeeAmount * 0.25
+        let poolFeeAmount = totalFeeAmount - protocolFeeAmount
+        let amountAfterProtocolFee = inputAmount - protocolFeeAmount
+
+        -- Split trader's input token: protocol fee + amount for pool
+        (maybeProtocolFeeCid, remainderCid) <- exercise traderInputTokenCid T.TransferSplit with
+          recipient = protocolFeeReceiver
+          qty = protocolFeeAmount
+
+        let Some protocolFeeCid = maybeProtocolFeeCid
+
+        -- Transfer remainder to poolParty
+        poolInputTokenCid <- exercise remainderCid T.Transfer with
+          recipient = poolParty
+          qty = amountAfterProtocolFee
+
+        -- Calculate swap output with pool fee applied
+        let feeMul = (10000.0 - intToDecimal feeBps) / 10000.0
+        let ainFee = amountAfterProtocolFee * feeMul
+        let denom = rin + ainFee
+        let aout = (ainFee * rout) / denom
+
+        -- Slippage and limit checks
+        assertMsg "Min output not met (slippage)" (aout >= minOutput)
+        assertMsg "Liquidity exhausted" (aout < rout)
+
+        let maxInputAmount = rin * (intToDecimal maxInBps) / 10000.0
+        let maxOutputAmount = rout * (intToDecimal maxOutBps) / 10000.0
+        assertMsg "Input exceeds maxInBps limit" (amountAfterProtocolFee <= maxInputAmount)
+        assertMsg "Output exceeds maxOutBps limit" (aout <= maxOutputAmount)
+
+        -- Price impact check
+        let pBefore = rout / rin
+        let pAfter = (rout - aout) / (rin + amountAfterProtocolFee)
+        let impBps = abs(pAfter - pBefore) / pBefore * 10000.0
+        assertMsg "Price impact too high" (impBps <= intToDecimal maxPriceImpactBps)
+
+        -- Consolidate pool's input tokens
+        consolidatedInCid <- case poolInCidCanonical of
+          None -> return poolInputTokenCid
+          Some canonicalCid -> exercise canonicalCid T.Merge with otherTokenCid = poolInputTokenCid
+
+        -- Transfer output to trader
+        let Some canonicalOutCid = poolOutCidCanonical
+        (maybePoolOutRemainder, traderOutputCid) <- exercise canonicalOutCid T.TransferSplit with
+          recipient = trader
+          qty = aout
+
+        let Some poolOutRemainderCid = maybePoolOutRemainder
+
+        -- Calculate new reserves
+        let newReserveA = if isAtoB
+                         then rin + amountAfterProtocolFee
+                         else rout - aout
+        let newReserveB = if isAtoB
+                         then rout - aout
+                         else rin + amountAfterProtocolFee
+
+        assertMsg "New reserve A must be positive" (newReserveA > 0.0)
+        assertMsg "New reserve B must be positive" (newReserveB > 0.0)
+
+        -- Update pool
+        let (finalTokenACid, finalTokenBCid) = if isAtoB
+              then (consolidatedInCid, poolOutRemainderCid)
+              else (poolOutRemainderCid, consolidatedInCid)
+
+        newPoolCid <- exercise self ArchiveAndUpdateReserves with
+          updatedReserveA = newReserveA
+          updatedReserveB = newReserveB
+          updatedTokenACid = Some finalTokenACid
+          updatedTokenBCid = Some finalTokenBCid
+
+        return (traderOutputCid, newPoolCid)

@@ -1,0 +1,204 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --ink:        #0B0B0D;
+  --ink-2:      #141417;
+  --ink-3:      #1E1E22;
+  --ink-4:      #2A2A2F;
+  --rule:       rgba(255,255,255,0.055);
+  --rule-gold:  rgba(196,162,100,0.22);
+  --paper:      #F4F1EB;
+  --paper-2:    #EDE9E0;
+  --paper-3:    #E2DDD3;
+  --gold:       #C4A264;
+  --gold-dim:   #9A7A48;
+  --gold-pale:  rgba(196,162,100,0.10);
+  --text-1:     #EDE9E0;
+  --text-2:     #8A8680;
+  --text-3:     #5A5855;
+  --text-dark:  #1A1814;
+  --green:      #4A8C6F;
+  --red-muted:  #8C4A4A;
+  --serif:      'Playfair Display', Georgia, serif;
+  --display:    'Cormorant Garamond', Georgia, serif;
+  --mono:       'DM Mono', 'Courier New', monospace;
+
+  /* Responsive tokens (desktop defaults) */
+  --main-max-w: 1100px;
+  --main-px: 1.5rem;
+  --main-py: 2rem;
+  --view-max-w: 900px;
+  --swap-max-w: 460px;
+  --liq-max-w: 700px;
+  --modal-max-w: 520px;
+  --login-max-w: 360px;
+  --header-px: 3rem;
+  --header-logo-gap: 2.5rem;
+  --nav-gap: 1.5rem;
+  --card-px: 1.6rem;
+  --form-px: 1.6rem;
+  --table-cell-px: 1.4rem;
+  --table-row-px: 1.4rem;
+  --footer-px: 2rem;
+  --footer-stats-gap: 2.5rem;
+  --input-font-size: 1.3rem;
+  --glow-w: 600px;
+  --glow-h: 350px;
+  --dropdown-min-w: 300px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--ink);
+  color: var(--text-1);
+  font-family: var(--serif);
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+}
+
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-track { background: var(--ink); }
+::-webkit-scrollbar-thumb { background: var(--ink-4); border-radius: 2px; }
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fu { animation: fadeUp 0.6s cubic-bezier(0.22,1,0.36,1) both; }
+
+@keyframes pulse-dot {
+  0%,100% { opacity:1; transform:scale(1); }
+  50%     { opacity:0.4; transform:scale(0.7); }
+}
+
+@keyframes shimmer {
+  0%   { background-position: -200px 0; }
+  100% { background-position: 200px 0; }
+}
+
+@keyframes spin-once {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(180deg); }
+}
+.spin-btn:active { animation: spin-once 0.3s ease; }
+
+.token-input-wrap {
+  position: relative; overflow: hidden;
+}
+.token-input-wrap::after {
+  content: '';
+  position: absolute; bottom: 0; left: 0;
+  width: 0; height: 1px;
+  background: var(--gold);
+  transition: width 0.4s cubic-bezier(0.22,1,0.36,1);
+}
+.token-input-wrap:focus-within::after { width: 100%; }
+
+.label-caps {
+  font-family: var(--mono); font-size: 0.75rem; letter-spacing: 0.22em;
+  text-transform: uppercase; color: var(--text-3);
+}
+.gold-rule {
+  width: 100%; height: 1px;
+  background: linear-gradient(90deg, var(--gold-dim), rgba(196,162,100,0.08), transparent);
+  border: none; margin: 0;
+}
+.rule-hover:hover { background: rgba(196,162,100,0.04); }
+
+.btn-primary {
+  background: var(--gold); color: var(--ink); border: none;
+  font-family: var(--mono); font-size: 0.8rem; letter-spacing: 0.14em;
+  text-transform: uppercase; font-weight: 500;
+  padding: 0 1.6rem; height: 40px; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 0.5rem;
+  transition: background 0.2s, transform 0.15s;
+}
+.btn-primary:hover { background: #D4B27A; }
+.btn-primary:active { transform: scale(0.98); }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-ghost {
+  background: transparent; border: 1px solid var(--rule);
+  color: var(--text-2);
+  font-family: var(--mono); font-size: 0.75rem; letter-spacing: 0.14em;
+  text-transform: uppercase; padding: 0 1.2rem; height: 36px;
+  cursor: pointer; display: inline-flex; align-items: center;
+  transition: border-color 0.2s, color 0.2s;
+}
+.btn-ghost:hover { border-color: var(--gold-dim); color: var(--text-1); }
+
+.nav-link {
+  font-family: var(--mono); font-size: 0.875rem; letter-spacing: 0.14em;
+  text-transform: uppercase; color: var(--text-2); cursor: pointer;
+  transition: color 0.2s; padding-bottom: 2px;
+  border-bottom: 1px solid transparent; text-decoration: none;
+}
+.nav-link:hover { color: var(--text-1); }
+.nav-link.active { color: var(--text-1); border-bottom-color: var(--gold-dim); }
+
+
+.token-select-btn {
+  background: var(--ink-3); border: 1px solid var(--rule);
+  color: var(--text-1); font-family: var(--mono); font-size: 0.85rem;
+  letter-spacing: 0.08em; padding: 0 0.85rem; height: 36px;
+  cursor: pointer; display: inline-flex; align-items: center;
+  gap: 0.4rem; transition: border-color 0.25s;
+  white-space: nowrap; flex-shrink: 0;
+}
+.token-select-btn:hover { border-color: var(--gold-dim); }
+
+.tab-btn {
+  font-family: var(--mono); font-size: 0.75rem; letter-spacing: 0.14em;
+  text-transform: uppercase; padding: 0.6rem 1.2rem; cursor: pointer;
+  border: none; background: transparent; transition: color 0.2s, border-color 0.2s;
+  border-bottom: 2px solid transparent; color: var(--text-3);
+}
+.tab-btn.active { color: var(--gold); border-bottom-color: var(--gold); }
+.tab-btn:not(.active):hover { color: var(--text-2); }
+
+.shimmer-block {
+  background: linear-gradient(90deg, var(--ink-3) 25%, var(--ink-4) 50%, var(--ink-3) 75%);
+  background-size: 400px 100%;
+  animation: shimmer 1.5s infinite linear;
+  border-radius: 2px;
+}
+
+/* ═══════════════════════════════════════════════
+   RESPONSIVE — Mobile (≤768px)
+   ═══════════════════════════════════════════════ */
+
+@media (max-width: 768px) {
+  :root {
+    /* Layout */
+    --main-max-w: 100%;
+    --main-px: 0.75rem;
+    --main-py: 1rem;
+    --view-max-w: 100%;
+    --swap-max-w: 100%;
+    --liq-max-w: 100%;
+    --modal-max-w: calc(100% - 1.5rem);
+    --login-max-w: calc(100% - 1.5rem);
+
+    /* Spacing */
+    --header-px: 0.75rem;
+    --header-logo-gap: 1rem;
+    --nav-gap: 0.75rem;
+    --card-px: 1rem;
+    --form-px: 1rem;
+    --table-cell-px: 0.75rem;
+    --table-row-px: 0.75rem;
+    --footer-px: 0.75rem;
+    --footer-stats-gap: 1rem;
+
+    /* Typography */
+    --input-font-size: 1rem;
+
+    /* Decorative */
+    --glow-w: 300px;
+    --glow-h: 200px;
+    --dropdown-min-w: unset;
+  }
+}

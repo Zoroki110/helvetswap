@@ -1,0 +1,98 @@
+module LPToken.LPToken where
+
+import DA.Action (void, when)
+
+{-
+  LP TOKEN DESIGN FOR AMM LIQUIDITY PROVISION
+
+  CRITICAL DESIGN DECISIONS:
+
+  1. SAME PATTERN AS Token.Token:
+     - Issuer-as-signatory (lpIssuer is the Pool's LP issuer party)
+     - Owner is observer only
+     - Enables bilateral transfers without recipient authorization
+
+  2. NO CONTRACT KEY (DAML 3.x Compatibility):
+     - DAML 3.x REMOVED contract key support
+     - LPTokens are tracked by ContractId only
+     - Pool must pass LPToken ContractIds to choices
+     - This matches Token.Token design for consistency
+
+  3. NONCONSUMING + MANUAL ARCHIVE:
+     - Same workaround as Token to avoid "contract consumed twice"
+     - Create new tokens FIRST, then archive self at END
+
+  4. POOLID:
+     - Text identifier for the pool (e.g., "ETH-USDC-0x123")
+     - Allows multiple pools with same token pair
+     - Used for key uniqueness
+-}
+
+template LPToken
+  with
+    issuer : Party      -- lpIssuer (the party that mints LP tokens for a pool)
+    owner  : Party      -- LP provider who owns these tokens
+    poolId : Text       -- Unique pool identifier
+    amount : Numeric 10 -- Number of LP tokens
+  where
+    signatory issuer  -- ONLY issuer is signatory
+    observer owner     -- owner can see their LP tokens
+
+    -- NO KEY: DAML 3.x does not support contract keys
+    -- LPTokens are tracked by ContractId directly
+
+    ensure amount > 0.0
+
+    -- Transfer: nonconsuming to manually control archiving order
+    -- Identical pattern to Token.Transfer
+    -- Self-transfer is allowed to support pool operations and consolidation
+    nonconsuming choice Transfer : ContractId LPToken
+      with
+        recipient : Party
+        qty       : Numeric 10
+      controller owner
+      do
+        assertMsg "Positive quantity" (qty > 0.0)
+        assertMsg "Sufficient balance" (qty <= amount)
+        -- Self-transfer check removed to allow pool operations
+
+        -- Archive FIRST (before creating remainder)
+        archive self
+
+        -- Create token for recipient
+        newToken <- create this with owner = recipient, amount = qty
+
+        -- Create remainder if needed (same owner, different amount)
+        when (qty < amount) $
+          void $ create this with owner = owner, amount = amount - qty
+
+        return newToken
+
+    -- Credit: merge/mint additional LP tokens for same owner
+    -- Used when adding more liquidity to existing position
+    choice Credit : ContractId LPToken
+      with qty : Numeric 10
+      controller owner
+      do
+        assertMsg "Positive credit" (qty > 0.0)
+        archive self
+        create this with amount = amount + qty
+
+    -- Burn: destroy LP tokens when removing liquidity
+    -- Returns the amount burned for verification
+    -- Must be nonconsuming to manually control archiving order
+    nonconsuming choice Burn : Numeric 10
+      with qty : Numeric 10
+      controller owner
+      do
+        assertMsg "Positive burn" (qty > 0.0)
+        assertMsg "Sufficient balance" (qty <= amount)
+
+        -- Archive FIRST (before creating remainder)
+        archive self
+
+        -- Create remainder if not burning full balance
+        when (qty < amount) $
+          void $ create this with amount = amount - qty
+
+        return qty

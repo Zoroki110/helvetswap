@@ -1,0 +1,26 @@
+# ClearportX Backend - DevNet Local Override (Ledger-Only Mode)
+# This profile uses Ledger API gRPC queries exclusively
+# DataSource autoconfiguration is disabled to avoid PQS dependency
+
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceTransactionManagerAutoConfiguration
+
+# Disable PQS health indicator
+management:
+  health:
+    db:
+      enabled: false
+
+# Health check should skip PQS
+health:
+  pqs-timeout-ms: 0  # Skip PQS health check entirely
+  ledger-timeout-ms: 5000
+
+logging:
+  level:
+    com.digitalasset.quickstart.pqs.Pqs: ERROR  # Suppress PQS errors
+    com.digitalasset.quickstart.utility.PqsSyncUtil: ERROR
+    org.springframework.jdbc: ERROR

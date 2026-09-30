@@ -1,0 +1,56 @@
+package com.digitalasset.quickstart.config;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.web.cors.CorsConfiguration;
+import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
+import org.springframework.web.filter.CorsFilter;
+import java.util.Arrays;
+
+@Configuration
+public class CorsConfig {
+
+    @Bean
+    public CorsFilter corsFilter() {
+        CorsConfiguration config = new CorsConfiguration();
+        
+        // Autoriser app.clearportx.com et localhost
+        config.setAllowedOrigins(Arrays.asList(
+            "https://app.clearportx.com",
+            "https://clearportx.com",
+            "http://localhost:3000",
+            "http://localhost:3001"
+        ));
+        
+        // Autoriser tous les headers nécessaires
+        config.setAllowedHeaders(Arrays.asList(
+            "Origin",
+            "Content-Type",
+            "Accept",
+            "Authorization",
+            "X-Requested-With",
+            "X-Idempotency-Key"
+        ));
+        
+        // Autoriser toutes les méthodes HTTP
+        config.setAllowedMethods(Arrays.asList("GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"));
+        
+        // Autoriser les credentials (cookies, auth headers)
+        config.setAllowCredentials(true);
+        
+        // Headers exposés au frontend
+        config.setExposedHeaders(Arrays.asList(
+            "Authorization",
+            "X-Total-Count",
+            "X-Rate-Limit-Remaining"
+        ));
+        
+        // Durée du cache preflight
+        config.setMaxAge(3600L);
+        
+        UrlBasedCorsConfigurationSource source = new UrlBasedCorsConfigurationSource();
+        source.registerCorsConfiguration("/**", config);
+        
+        return new CorsFilter(source);
+    }
+}
